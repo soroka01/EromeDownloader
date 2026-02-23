@@ -391,13 +391,8 @@ if __name__ == "__main__":
 
 # Что нужно ввести в консоль чтобы залить код в сущесвтующий репозиторий на GitHub:
 # git init
-# Указать ссылку на репозиторий (один раз):
-# git remote add origin
-# git remote add origin -m main https://github.com/soroka01/EromeDownloader.git
-# git add .
-# git commit -m "Your commit message"
-# git push origin main
-# Если репозиторий уже существует и нужно просто обновить код:
-# git add .
-# git commit -m "Your commit message"
-# git push origin main
+# git add README.md
+# git commit -m "first commit"
+# git branch -M main
+# git remote add origin git@github.com:soroka01/EromeDownloader.git
+# git push -u origin main
