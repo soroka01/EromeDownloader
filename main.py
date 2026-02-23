@@ -24,7 +24,7 @@ def print_boxed(text, color=Fore.CYAN):
 
 USER_AGENT = "Mozilla/5.0"
 HOST = "www.erome.com"
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 65536
 DELETED_MARKER = "__DELETED__"
 
 def status_file_path(name: str) -> str:
