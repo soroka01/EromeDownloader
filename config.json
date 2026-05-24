@@ -1,0 +1,17 @@
+{
+  "max_connections": 6,
+  "min_connections_per_parallel_album": 3,
+  "max_parallel_albums": 3,
+  "auto_sort_links": true,
+  "album_prefetch_connections": 6,
+  "account_page_connections": 3,
+  "account_max_pages": 500,
+  "chunk_size_mb": 1,
+  "max_attempts": 4,
+  "page_attempts": 3,
+  "connect_timeout": 30,
+  "idle_timeout": 180,
+  "skip_videos": false,
+  "skip_images": false,
+  "manifest_path": "links/manifest.json"
+}

@@ -1,49 +1,86 @@
-# EromeDownloader V2
+# EromeDownloader
 
-EromeDownloader is a compact and powerful Python script for downloading albums from erome.com (videos, images, gifs).
+EromeDownloader is a Python script for downloading erome.com albums: videos,
+images, and gifs. It runs interactively and can resume interrupted downloads.
 
-## How to use?
+## Install
 
-1. Install dependencies:
-
-```
+```bash
 pip install -r requirements.txt
 ```
 
-2. Run the script:
+## Run
 
+```bash
+python main.py
 ```
-python dump.py
+
+Choose a mode after launch:
+
+1. Download one URL: album, direct file, or account.
+2. Download all links from `links/pending.txt`.
+3. Check tracked accounts from `links/accs.txt`.
+4. Only scan tracked accounts and add new posts to `links/pending.txt`.
+
+The `links` directory is created automatically. `links/pending.txt` can contain
+album links, direct file links, and account links. Use `links/accs.txt` for a
+persistent account watchlist, one URL per line. This file is not cleared after a
+run.
+
+The script does not ask technical tuning questions on every launch. Settings are
+stored in `config.json`: connections, timeouts, sorting, video/image skipping,
+and the manifest path can be changed there.
+
+## Output
+
+Files are saved to `downloads`. Album downloads get a separate subdirectory named
+after the album.
+
+## Link Statuses
+
+- `links/pending.txt` — links not processed yet.
+- `links/accs.txt` — persistent account watchlist.
+- `links/ready.txt` — successfully downloaded links.
+- `links/failed.txt` — links that failed after retries.
+- `links/banned.txt` — unavailable links, for example 403/404/410.
+- `links/ready_accs.txt` — successfully processed accounts.
+- `links/failed_accs.txt` — accounts that failed.
+- `links/banned_accs.txt` — unavailable accounts.
+- `links/manifest.json` — downloaded manifest: URL, folder, size, date, status.
+
+## Download Improvements
+
+- Resumable `.part` downloads.
+- Retries for timeouts and temporary server errors.
+- Larger chunks for faster file writes.
+- Controlled concurrent connections to avoid overloading the server.
+- Multiple albums can run in parallel in batch mode: the total connection limit
+  is shared between active albums instead of being multiplied.
+- Photo-only albums are downloaded before video albums and sorted by photo count
+  from smaller to larger.
+- Photo-only albums use wider parallelism: more albums at the same time without
+  exceeding the total connection limit.
+- Fast first-pass queue sorting without network requests: direct files, then
+  albums, then accounts. Detailed album sorting reuses the album page that is
+  needed for downloading anyway.
+- Duplicate filename protection inside albums.
+- Honest final status: an album is successful only when its files were actually
+  downloaded or already existed.
+- Account tracking: the script crawls `?page=N` pages, collects all `/a/...`
+  posts, skips albums already present in `ready.txt`/`banned.txt`, and keeps
+  accounts in `accs.txt` for the next run.
+- Scan-only account mode: add new albums to `pending.txt` without downloading.
+- The manifest is updated after file downloads, album downloads, and account
+  processing.
+
+## Import Links From Bookmarks
+
+1. Export browser bookmarks to `bookmarks.html`.
+2. Put the file next to the scripts.
+3. Run:
+
+```bash
+python extract_links.py
 ```
 
-3. Follow the interactive console instructions:
-- Choose mode (single link or batch)
-- Set download parameters
-- For batch mode, add links to `links/pending.txt` (one per line)
-
-## Arguments
-
-- All parameters are entered via console dialog.
-- Links for batch mode are taken from `links/pending.txt`.
-
-## Where are files saved?
-
-Files are saved in the `downloads` folder, with a subfolder named after the album.
-
-## Link statuses
-
-- `links/pending.txt` — waiting for download
-- `links/ready.txt` — successfully downloaded
-- `links/failed.txt` — errors (can be re-added to pending.txt for retry)
-
-## Features
-
-- Automatic retry on failure/hang
-- Dynamic connection adaptation
-- Beautiful progress bar
-- User-friendly interactive interface
-- Link sorting by weight: downloads start from the smallest files (lowest size)
-- For bulk import of links from Chrome bookmarks, use extract_links.py:
-	1. Export bookmarks from Chrome to bookmarks.html
-	2. Run: python extract_links.py
-	3. Links will be automatically saved to links/pending.txt
+The script extracts album links and saves them to `links/pending.txt`.
