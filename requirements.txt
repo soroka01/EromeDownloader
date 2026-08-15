@@ -1,5 +1,5 @@
-aiofiles==24.1.0
-aiohttp==3.10.5
-beautifulsoup4==4.12.3
+aiofiles==25.1.0
+aiohttp==3.14.3
+beautifulsoup4==4.15.0
 colorama==0.4.6
-tqdm==4.66.5
+tqdm==4.70.0

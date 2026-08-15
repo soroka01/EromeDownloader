@@ -4,7 +4,7 @@
 
 🌐 **Язык:** [Русский](README.md) · [English](README_EN.md)
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![Async](https://img.shields.io/badge/Async-aiohttp%203.10.5-2C5BB4)
 ![Interface](https://img.shields.io/badge/Interface-CLI-4B5563)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -82,7 +82,8 @@ start.bat         # Windows bootstrap launcher
 
 ## 📋 Требования
 
-- Python 3.10 или новее;
+- Python 3.14 или новее (рекомендуется актуальный патч 3.14.6);
+- pip 26.1.2, setuptools 84.0.0 и wheel 0.48.0 (launcher обновляет их автоматически);
 - интернет-доступ;
 - зависимости из `requirements.txt`.
 

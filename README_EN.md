@@ -4,7 +4,7 @@
 
 🌐 **Language:** [Русский](README.md) · [English](README_EN.md)
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![Async](https://img.shields.io/badge/Async-aiohttp%203.10.5-2C5BB4)
 ![Interface](https://img.shields.io/badge/Interface-CLI-4B5563)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -82,7 +82,8 @@ The main implementation intentionally lives in one large `main.py`; there is cur
 
 ## 📋 Requirements
 
-- Python 3.10 or newer;
+- Python 3.14 or newer (the latest 3.14.6 patch is recommended);
+- pip 26.1.2, setuptools 84.0.0, and wheel 0.48.0 (the launcher upgrades them automatically);
 - internet access;
 - dependencies from `requirements.txt`.
 
