@@ -1,95 +1,18 @@
-# 📥 EromeDownloader
+# EromeDownloader
 
-> An interactive asynchronous downloader for Erome albums you are allowed to save, direct media, and account pages, with queues, resumable downloads, statuses, and a JSON manifest.
+[Русский](README.md) · [English](README_EN.md)
 
-🌐 **Language:** [Русский](README.md) · [English](README_EN.md)
+Command-line downloader for public Erome albums, media files, and accounts. Supports queues, parallel downloads, resuming, and tracking new albums.
 
-![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
-![Async](https://img.shields.io/badge/Async-aiohttp%203.10.5-2C5BB4)
-![Interface](https://img.shields.io/badge/Interface-CLI-4B5563)
-![License](https://img.shields.io/badge/License-MIT-green)
+## Requirements
 
-## ✨ Overview
-
-EromeDownloader processes individual links and local queues, fetches public album and account pages, downloads discovered images and videos, and saves the result to `downloads/`. Incomplete files retain the `.part` extension, while batch modes maintain separate `ready`, `failed`, and `banned` lists.
-
-> [!IMPORTANT]
-> Download only material that you are allowed to save. You are responsible for complying with copyright, privacy, applicable law, and Erome's rules. This project is not affiliated with Erome.
-
-## 🚀 Key Features
-
-| Feature | How it works |
-| --- | --- |
-| Albums | Parses the title, images, and video sources from the page |
-| Direct files | Downloads any entered URL as an individual file |
-| Accounts | Collects albums from every discovered page of a public profile |
-| Queue | Processes `pending.txt` with deduplication and persistent statuses |
-| Resume | Uses `.part` files and HTTP `Range` when the server supports partial responses |
-| Concurrency | Shares a global connection limit between files and albums |
-| Manifest | Stores URLs, paths, sizes, statuses, and update times in JSON |
-
-Additional capabilities include:
-
-- exponential backoff for temporary HTTP and network errors;
-- sorting direct URLs, albums, and accounts;
-- estimating album size in advance through `HEAD` or a range request;
-- protection against duplicate filenames within one set of download jobs;
-- image and video filters;
-- importing album URLs from exported browser bookmarks.
-
-## 🧭 Modes
-
-After launch, choose one of four modes:
-
-| Mode | Source | Behavior |
-| --- | --- | --- |
-| `1` | Console URL | Downloads one direct URL, one album, or all new albums from an account |
-| `2` | `links/pending.txt` | Processes the queue, retries failures, and updates link status files |
-| `3` | `links/accs.txt` | Checks tracked accounts and downloads new albums |
-| `4` | `links/accs.txt` | Only discovers new albums and adds them to `pending.txt` |
-
-Important differences:
-
-- mode `1` writes available data to the manifest but does not maintain `ready.txt`, `failed.txt`, and `banned.txt` as a batch queue;
-- mode `3` always collects both images and videos: the current implementation does not apply `skip_images` or `skip_videos` to it;
-- mode `4` treats URLs from `ready`, `banned`, `failed`, and `pending` as already known, so a failed URL is not returned to the queue automatically.
-
-## 🏗️ Data Flow and Architecture
-
-```text
-console URL / pending.txt / accs.txt
-                 ↓
-       normalize + classify
-         ↙       ↓       ↘
-    direct     album    account pages
-                 ↓          ↓
-             media URLs ← album URLs
-                 ↓
-        async download workers
-                 ↓
- downloads/ + status files + manifest.json
-```
-
-```text
-main.py           # config, queues, parsers, networking, downloads, and CLI
-extract_links.py  # separate bookmark importer
-config.json       # safe runtime defaults without credentials
-requirements.txt  # Python dependencies
-start.bat         # Windows bootstrap launcher
-```
-
-The main implementation intentionally lives in one large `main.py`; there is currently no separate package API or command-line argument interface.
-
-## 📋 Requirements
-
-- Python 3.14 or newer (the latest 3.14.6 patch is recommended);
-- pip 26.1.2, setuptools 84.0.0, and wheel 0.48.0 (the launcher upgrades them automatically);
+- Python 3.14 or newer;
 - internet access;
 - dependencies from `requirements.txt`.
 
 Erome authentication, cookies, and private albums are not supported.
 
-## ⚙️ Installation and Running
+## Quick start
 
 ### Windows launcher
 
@@ -119,7 +42,33 @@ python3 -m venv .venv
 
 The `downloads/` and `links/` directories are created automatically.
 
-## 🔧 Configuration
+## How it works
+
+```mermaid
+flowchart TD
+    A["URL / links/pending.txt / links/accs.txt"] --> B["Download queue"]
+    B["Download queue"] --> C["downloads/ + .part"]
+    C["downloads/ + .part"] --> D["Statuses + JSON manifest"]
+```
+
+## Modes
+
+After launch, choose one of four modes:
+
+| Mode | Source | Behavior |
+| --- | --- | --- |
+| `1` | Console URL | Downloads one direct URL, one album, or all new albums from an account |
+| `2` | `links/pending.txt` | Processes the queue, retries failures, and updates link status files |
+| `3` | `links/accs.txt` | Checks tracked accounts and downloads new albums |
+| `4` | `links/accs.txt` | Only discovers new albums and adds them to `pending.txt` |
+
+Important differences:
+
+- mode `1` writes available data to the manifest but does not maintain `ready.txt`, `failed.txt`, and `banned.txt` as a batch queue;
+- mode `3` always collects both images and videos: the current implementation does not apply `skip_images` or `skip_videos` to it;
+- mode `4` treats URLs from `ready`, `banned`, `failed`, and `pending` as already known, so a failed URL is not returned to the queue automatically.
+
+## Configuration
 
 `config.json` contains the complete set of defaults:
 
@@ -169,7 +118,7 @@ The `downloads/` and `links/` directories are created automatically.
 
 If the file is missing, the program creates it with built-in defaults. Keys missing from an older file also receive their built-in values. User-provided value types and ranges are not validated separately, so change them carefully.
 
-## 🗂️ Queues, Statuses, and Manifest
+## Queues, Statuses, and Manifest
 
 | Path | Purpose |
 | --- | --- |
@@ -187,7 +136,7 @@ Add one URL per line. Empty lines and lines beginning with `#` are ignored by th
 
 After a final error, mode `2` removes the URL from `pending.txt` and places it in `failed.txt`. To try again, manually add the URL back to `pending.txt`; a successful result will move it to `ready.txt`.
 
-## 🔖 Importing from Bookmarks
+## Importing from Bookmarks
 
 1. Export browser bookmarks to a `bookmarks*.html` file.
 2. Put it next to `main.py`.
@@ -202,26 +151,20 @@ After a final error, mode `2` removes the URL from `pending.txt` and places it i
 > [!WARNING]
 > The current importer **replaces the contents** of `links/pending.txt` with the links it finds. It does not merge them with the existing queue. Back up the old file or merge the lists manually if the queue is already populated.
 
-## 🔐 Security
+## Security
 
 - The project does not require passwords, cookies, or API keys.
 - A direct URL is not restricted to the Erome domain; use trusted links only.
 - `downloads/`, `links/`, `.venv/`, and logs are excluded from Git.
 - The manifest may contain source URLs and local filenames; consider this before publishing it.
 
-## 🧪 Limitations and Testing
+## Limitations
 
 - Parsing depends on Erome's current HTML structure: `og:title`, `<source>`, and `img.img-back`.
 - Resume works only when the server correctly supports `Range`; otherwise the file is downloaded again from the beginning.
 - Size may remain unknown if the server does not provide it through `HEAD` or a range response.
-- The repository has no automated tests or CI.
-- You can check syntax without making network requests:
 
-  ```bash
-  python -m compileall -q main.py extract_links.py
-  ```
-
-## 🩹 Troubleshooting
+## Troubleshooting
 
 | Symptom | What to check |
 | --- | --- |
@@ -232,10 +175,14 @@ After a final error, mode `2` removes the URL from `pending.txt` and places it i
 | Manifest is corrupted | The program moves it to a file with the `.bad` suffix |
 | Download stalls | `connect_timeout`, `idle_timeout`, and server availability |
 
-## 📄 License
+## License
 
-This project is distributed under the [MIT License](LICENSE).
+[MIT](LICENSE).
+
+## Support
+
+Feel free to [fork this repository](https://github.com/soroka01/EromeDownloader/fork) and adapt it. If it helped you, leave a [Star](https://github.com/soroka01/EromeDownloader) so I can see it was useful.
 
 ---
 
-📥 The queue remains transparent: media in `downloads/`, state in `links/`.
+with love ❤️
