@@ -180,6 +180,42 @@ async def download_album_data(
     return status
 
 
+async def run_with_retry(
+    urls: list[str],
+    max_connections: int,
+    skip_videos: bool,
+    skip_images: bool,
+    label: str,
+    retry_label: str,
+    retry_message: Callable[[int], str],
+    initial_callback: DownloadResultCallback,
+    final_callback: DownloadResultCallback,
+) -> tuple[list[str], list[str]]:
+    """Скачивает ссылки и один раз повторяет упавшие. Возвращает (banned, failed)."""
+
+    async def run(batch: list[str], batch_label: str, callback: DownloadResultCallback):
+        return await download_links_parallel(
+            urls=batch,
+            max_connections=max_connections,
+            skip_videos=skip_videos,
+            skip_images=skip_images,
+            label=batch_label,
+            result_callback=callback,
+        )
+
+    results = await run(urls, label, initial_callback)
+    banned = [url for url, result in results if result == "banned"]
+    failed = [url for url, result in results if result == "failed"]
+
+    if failed:
+        log_retry(retry_message(len(failed)))
+        retry_results = await run(failed, retry_label, final_callback)
+        banned += [url for url, result in retry_results if result == "banned"]
+        failed = [url for url, result in retry_results if result == "failed"]
+
+    return banned, failed
+
+
 async def dump_account(
     account_url: str,
     max_connections: int,
@@ -234,43 +270,17 @@ async def dump_account(
     mark_album_initial_result = result_marker(set_status, failed_is_final=False)
     mark_album_final_result = result_marker(set_status, failed_is_final=True)
 
-    results = await download_links_parallel(
-        urls=pending_album_urls,
-        max_connections=max_connections,
-        skip_videos=skip_videos,
-        skip_images=skip_images,
+    banned_urls, failed_urls = await run_with_retry(
+        pending_album_urls,
+        max_connections,
+        skip_videos,
+        skip_images,
         label=account_name,
-        result_callback=mark_album_initial_result,
+        retry_label=f"{account_name} retry",
+        retry_message=lambda count: f"{account_name}: повторная попытка для {count} постов",
+        initial_callback=mark_album_initial_result,
+        final_callback=mark_album_final_result,
     )
-
-    banned_urls = [
-        album_url
-        for album_url, result in results
-        if result == "banned"
-    ]
-    failed_urls = [
-        album_url
-        for album_url, result in results
-        if result == "failed"
-    ]
-
-    if failed_urls:
-        log_retry(f"{account_name}: повторная попытка для {len(failed_urls)} постов")
-        retry_failed: list[str] = []
-        retry_results = await download_links_parallel(
-            urls=failed_urls,
-            max_connections=max_connections,
-            skip_videos=skip_videos,
-            skip_images=skip_images,
-            label=f"{account_name} retry",
-            result_callback=mark_album_final_result,
-        )
-        for album_url, result in retry_results:
-            if result == "banned":
-                banned_urls.append(album_url)
-            elif result == "failed":
-                retry_failed.append(album_url)
-        failed_urls = retry_failed
 
     if failed_urls:
         log_warn(
@@ -687,36 +697,17 @@ async def batch_download(
         set_download_status, failed_is_final=True, after=forget_pending
     )
 
-    regular_results = await download_links_parallel(
-        urls=regular_links,
-        max_connections=max_connections,
-        skip_videos=skip_videos,
-        skip_images=skip_images,
+    await run_with_retry(
+        regular_links,
+        max_connections,
+        skip_videos,
+        skip_images,
         label="BATCH",
-        result_callback=mark_initial_result,
+        retry_label="RETRY",
+        retry_message=lambda count: f"Повторная попытка: {count}",
+        initial_callback=mark_initial_result,
+        final_callback=mark_final_result,
     )
-
-    failed_urls = [
-        url
-        for url, result in regular_results
-        if result == "failed"
-    ]
-
-    if failed_urls:
-        log_retry(f"Повторная попытка: {len(failed_urls)}")
-        retry_results = await download_links_parallel(
-            urls=failed_urls,
-            max_connections=max_connections,
-            skip_videos=skip_videos,
-            skip_images=skip_images,
-            label="RETRY",
-            result_callback=mark_final_result,
-        )
-        failed_urls = [
-            url
-            for url, result in retry_results
-            if result == "failed"
-        ]
 
     for index, url in enumerate(account_links, 1):
         log(f"{index}/{len(account_links)} {short_url(url)}", Fore.CYAN, "ACCOUNT")
