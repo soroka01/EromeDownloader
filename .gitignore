@@ -1,13 +1,11 @@
+# Python
 __pycache__/
-.env
-.venv
-env/
+*.py[cod]
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
-downloads/*
-links/*
-*.txt
+.env
+
+# Runtime data
+downloads/
+links/
 *.log
-manifest.json
