@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -395,6 +396,44 @@ def progress_options(
     return options
 
 
+def make_session(
+    limit: int,
+    headers: dict | None = None,
+    timeout: ClientTimeout | None = None,
+) -> aiohttp.ClientSession:
+    limit = max(1, limit)
+    if timeout is None:
+        timeout = ClientTimeout(
+            total=None,
+            connect=CONNECT_TIMEOUT,
+            sock_connect=CONNECT_TIMEOUT,
+            sock_read=IDLE_TIMEOUT,
+        )
+    return aiohttp.ClientSession(
+        connector=TCPConnector(limit=limit, limit_per_host=limit, ttl_dns_cache=300),
+        headers={"User-Agent": USER_AGENT, **(headers or {})},
+        timeout=timeout,
+    )
+
+
+async def drain_tasks(tasks: list[asyncio.Task], on_result=None, progress=None) -> None:
+    """Ждёт задачи по мере завершения; при ошибке отменяет остальные."""
+    try:
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            if on_result:
+                on_result(result)
+            if progress is not None:
+                progress.update(1)
+    finally:
+        for task in tasks:
+            task.cancel()
+
+
+def optional_progress(enabled: bool, **kwargs):
+    return tqdm(**kwargs) if enabled else nullcontext()
+
+
 def log(message: str, color=Fore.WHITE, level: str = "INFO") -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
     tag = level.upper()[:7].ljust(7)
@@ -486,39 +525,46 @@ def empty_manifest() -> dict:
     }
 
 
+_manifest_cache: dict | None = None
+
+
+def _normalize_manifest(manifest: object) -> dict:
+    if not isinstance(manifest, dict):
+        return empty_manifest()
+    manifest.setdefault("version", 1)
+    manifest.setdefault("created_at", now_iso())
+    for section in ("files", "albums", "accounts"):
+        if not isinstance(manifest.get(section), dict):
+            manifest[section] = {}
+    return manifest
+
+
 def load_manifest() -> dict:
+    """Возвращает манифест; файл читается с диска только один раз за запуск."""
+    global _manifest_cache
+    if _manifest_cache is not None:
+        return _manifest_cache
+
     path = manifest_file_path()
     if not path.exists():
-        return empty_manifest()
+        _manifest_cache = empty_manifest()
+        return _manifest_cache
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         bad_path = path.with_suffix(path.suffix + ".bad")
         path.replace(bad_path)
         log_warn(f"Manifest повреждён, старый файл перенесён в {relative_path(bad_path)}")
-        return empty_manifest()
+        loaded = None
 
-    if not isinstance(manifest, dict):
-        return empty_manifest()
-
-    manifest.setdefault("version", 1)
-    manifest.setdefault("created_at", now_iso())
-    manifest.setdefault("files", {})
-    manifest.setdefault("albums", {})
-    manifest.setdefault("accounts", {})
-    manifest["updated_at"] = now_iso()
-    return manifest
+    _manifest_cache = _normalize_manifest(loaded)
+    return _manifest_cache
 
 
 def save_manifest(manifest: dict) -> None:
     path = manifest_file_path()
     manifest["updated_at"] = now_iso()
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
+    write_text_atomic(path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
 
 
 def record_file_results(
@@ -603,32 +649,82 @@ def read_clean_lines(path: Path) -> list[str]:
     ]
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(text, encoding="utf-8")
+    temp_path.replace(path)
+
+
+def clean_queue_links(links: Iterable[str]) -> list[str]:
+    return dedupe_preserve_order(
+        stripped
+        for stripped in (link.strip() for link in links if link)
+        if stripped and not stripped.startswith("#")
+    )
+
+
+# Кэш содержимого файлов links/*.txt: порядок сохраняется, проверка членства O(1).
+# Файл читается один раз за запуск, на диск пишется только при реальном изменении.
+_queue_cache: dict[str, dict[str, None]] = {}
+
+
+def _queue_entries(name: str) -> dict[str, None]:
+    entries = _queue_cache.get(name)
+    if entries is None:
+        entries = dict.fromkeys(clean_queue_links(read_clean_lines(status_file_path(name))))
+        _queue_cache[name] = entries
+    return entries
+
+
+def _flush_queue(name: str) -> None:
+    links = list(_queue_entries(name))
+    write_text_atomic(
+        status_file_path(name),
+        "\n".join(links) + ("\n" if links else ""),
+    )
+
+
+def write_queue(name: str, links: Iterable[str]) -> None:
+    _queue_cache[name] = dict.fromkeys(clean_queue_links(links))
+    _flush_queue(name)
+
+
+def read_queue(name: str) -> list[str]:
+    path = status_file_path(name)
+    if not path.exists():
+        path.touch()
+        return []
+    return list(_queue_entries(name))
+
+
 def add_status(url: str, status: str) -> None:
-    path = status_file_path(status)
-    lines = read_clean_lines(path)
-    if url not in set(lines):
-        write_queue(status, [*lines, url])
+    entries = _queue_entries(status)
+    if url not in entries:
+        entries[url] = None
+        _flush_queue(status)
 
 
 def remove_status(url: str, status: str) -> None:
-    path = status_file_path(status)
-    lines = [line for line in read_clean_lines(path) if line != url]
-    write_queue(status, lines)
+    entries = _queue_entries(status)
+    if url in entries:
+        del entries[url]
+        _flush_queue(status)
 
 
-def set_status(url: str, status: str) -> None:
-    for name in STATUS_FILES:
-        if name != status:
-            remove_status(url, name)
-    add_status(url, status)
-
-
-def set_account_status(url: str, status: str) -> None:
-    status_file = f"{status}_accs"
-    for name in ACCOUNT_STATUS_FILES:
+def _set_exclusive_status(url: str, status_file: str, group: Iterable[str]) -> None:
+    for name in group:
         if name != status_file:
             remove_status(url, name)
     add_status(url, status_file)
+
+
+def set_status(url: str, status: str) -> None:
+    _set_exclusive_status(url, status, STATUS_FILES)
+
+
+def set_account_status(url: str, status: str) -> None:
+    _set_exclusive_status(url, f"{status}_accs", ACCOUNT_STATUS_FILES)
 
 
 def set_download_status(url: str, status: str) -> None:
@@ -639,36 +735,7 @@ def set_download_status(url: str, status: str) -> None:
 
 
 def read_status_set(status: str) -> set[str]:
-    return set(read_clean_lines(status_file_path(status)))
-
-
-def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + ".tmp")
-    temp_path.write_text(text, encoding="utf-8")
-    temp_path.replace(path)
-
-
-def write_queue(name: str, links: Iterable[str]) -> None:
-    path = status_file_path(name)
-    clean_links = [
-        link.strip()
-        for link in links
-        if link and link.strip() and not link.strip().startswith("#")
-    ]
-    clean_links = dedupe_preserve_order(clean_links)
-    write_text_atomic(
-        path,
-        "\n".join(clean_links) + ("\n" if clean_links else ""),
-    )
-
-
-def read_queue(name: str) -> list[str]:
-    path = status_file_path(name)
-    if not path.exists():
-        path.touch()
-        return []
-    return read_clean_lines(path)
+    return set(_queue_entries(status))
 
 
 def write_pending(links: Iterable[str]) -> None:
@@ -680,39 +747,34 @@ def read_pending() -> list[str]:
 
 
 def append_pending_links(links: Iterable[str]) -> int:
-    current = read_pending()
-    current_set = set(current)
-    additions = []
+    entries = _queue_entries("pending")
+    additions = 0
     for link in links:
         normalized = normalize_download_url(link)
-        if normalized and normalized not in current_set:
-            additions.append(normalized)
-            current_set.add(normalized)
-    additions = dedupe_preserve_order(additions)
+        if normalized and normalized not in entries:
+            entries[normalized] = None
+            additions += 1
     if additions:
-        write_pending([*current, *additions])
-    return len(additions)
+        _flush_queue("pending")
+    return additions
 
 
 class PendingQueue:
     def __init__(self, links: Iterable[str]):
-        self.remaining = dedupe_preserve_order(
+        self.remaining: dict[str, None] = dict.fromkeys(
             normalize_download_url(link)
             for link in links
             if link and link.strip()
         )
-        self.remaining_set = set(self.remaining)
 
     def flush(self) -> None:
         write_pending(self.remaining)
 
     def remove(self, url: str) -> None:
         normalized = normalize_download_url(url)
-        if normalized not in self.remaining_set:
-            return
-        self.remaining_set.remove(normalized)
-        self.remaining = [link for link in self.remaining if link != normalized]
-        self.flush()
+        if normalized in self.remaining:
+            del self.remaining[normalized]
+            self.flush()
 
 
 def read_accounts() -> list[str]:
@@ -850,6 +912,14 @@ def sort_album_data(albums: Iterable[AlbumData]) -> list[AlbumData]:
     return sorted(albums, key=album_data_sort_key)
 
 
+def prepare_account_links(links: Iterable[str]) -> list[str]:
+    return dedupe_preserve_order(
+        normalize_account_url(link)
+        for link in clean_queue_links(links)
+        if is_erome_account_url(normalize_download_url(link))
+    )
+
+
 def prepare_download_links(links: Iterable[str], sort_links: bool) -> list[str]:
     prepared = [
         normalize_download_url(link)
@@ -872,6 +942,26 @@ def choose_parallel_album_count(item_count: int, max_connections: int) -> int:
 
 def per_album_connection_limit(max_connections: int, parallel_albums: int) -> int:
     return max(1, max_connections // max(1, parallel_albums))
+
+
+def result_marker(
+    set_state: Callable[[str, str], None],
+    failed_is_final: bool,
+    after: Callable[[str], None] | None = None,
+) -> DownloadResultCallback:
+    """Колбэк, фиксирующий итог ссылки в status-файлах (failed — только если он финальный)."""
+
+    def mark(url: str, result: str) -> None:
+        if result in {"success", "banned"}:
+            set_state(url, "ready" if result == "success" else "banned")
+        elif failed_is_final:
+            set_state(url, "failed")
+        else:
+            return
+        if after:
+            after(url)
+
+    return mark
 
 
 def is_finished_download_url(url: str, ready_urls: set[str], banned_urls: set[str]) -> bool:
@@ -1021,21 +1111,12 @@ async def estimate_album_sizes_batch(
         1,
         min(ALBUM_SIZE_PROBE_CONNECTIONS, media_count),
     )
-    timeout = ClientTimeout(
+    probe_timeout = ClientTimeout(
         total=ALBUM_SIZE_PROBE_TIMEOUT,
         connect=min(CONNECT_TIMEOUT, ALBUM_SIZE_PROBE_TIMEOUT),
         sock_connect=min(CONNECT_TIMEOUT, ALBUM_SIZE_PROBE_TIMEOUT),
         sock_read=ALBUM_SIZE_PROBE_TIMEOUT,
     )
-    connector = TCPConnector(
-        limit=probe_connections,
-        limit_per_host=probe_connections,
-        ttl_dns_cache=300,
-    )
-    headers = {
-        "Accept": "*/*",
-        "User-Agent": USER_AGENT,
-    }
     semaphore = asyncio.Semaphore(probe_connections)
 
     log(
@@ -1044,28 +1125,21 @@ async def estimate_album_sizes_batch(
         Fore.CYAN,
         "SIZE",
     )
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers=headers,
-        timeout=timeout,
+    async with make_session(
+        probe_connections, {"Accept": "*/*"}, probe_timeout
     ) as session:
         tasks = [
             asyncio.create_task(estimate_album_size(album, session, semaphore))
             for album in albums
         ]
-        if show_progress:
-            with tqdm(
-                total=len(tasks),
-                desc=f"[{label}] size scan",
-                unit="album",
-                **progress_options("YELLOW", leave=False),
-            ) as size_progress:
-                for task in asyncio.as_completed(tasks):
-                    await task
-                    size_progress.update(1)
-        else:
-            for task in asyncio.as_completed(tasks):
-                await task
+        with optional_progress(
+            show_progress,
+            total=len(tasks),
+            desc=f"[{label}] size scan",
+            unit="album",
+            **progress_options("YELLOW", leave=False),
+        ) as size_progress:
+            await drain_tasks(tasks, progress=size_progress)
 
     full_count = sum(album.has_full_size for album in albums)
     partial_count = sum(
@@ -1171,8 +1245,11 @@ async def _collect_account_page_albums(
     session: aiohttp.ClientSession,
     page_url: str,
     account_url: str,
-) -> tuple[str, list[str]]:
-    html_content = await _fetch_text_page(session, page_url, "account page")
+) -> tuple[str, list[str]] | AlbumFetchError:
+    try:
+        html_content = await _fetch_text_page(session, page_url, "account page")
+    except AlbumFetchError as error:
+        return error
     page_albums, _ = parse_account_html(
         html_content,
         base_url=page_url,
@@ -1211,18 +1288,6 @@ async def collect_album_data_batch(
     if not album_urls:
         return [], []
 
-    timeout = ClientTimeout(
-        total=None,
-        connect=CONNECT_TIMEOUT,
-        sock_connect=CONNECT_TIMEOUT,
-        sock_read=IDLE_TIMEOUT,
-    )
-    connector = TCPConnector(
-        limit=min(ALBUM_PREFETCH_CONNECTIONS, len(album_urls)),
-        limit_per_host=min(ALBUM_PREFETCH_CONNECTIONS, len(album_urls)),
-        ttl_dns_cache=300,
-    )
-    headers = {"User-Agent": USER_AGENT}
     albums: list[AlbumData] = []
     failures: list[tuple[str, str]] = []
 
@@ -1239,37 +1304,25 @@ async def collect_album_data_batch(
             status = "banned" if error.status in UNAVAILABLE_STATUSES else "failed"
             return url, None, status
 
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers=headers,
-        timeout=timeout,
-    ) as session:
+    def on_scanned(item: tuple[str, AlbumData | None, str | None]) -> None:
+        url, album_data, status = item
+        if album_data:
+            albums.append(album_data)
+        elif status:
+            failures.append((url, status))
+            if result_callback:
+                result_callback(url, status)
+
+    async with make_session(min(ALBUM_PREFETCH_CONNECTIONS, len(album_urls))) as session:
         tasks = [asyncio.create_task(collect_one(url)) for url in album_urls]
-        if show_progress:
-            with tqdm(
-                total=len(tasks),
-                desc=f"[{label}] album scan",
-                unit="album",
-                **progress_options("YELLOW", leave=False),
-            ) as scan_progress:
-                for task in asyncio.as_completed(tasks):
-                    url, album_data, status = await task
-                    if album_data:
-                        albums.append(album_data)
-                    elif status:
-                        failures.append((url, status))
-                        if result_callback:
-                            result_callback(url, status)
-                    scan_progress.update(1)
-        else:
-            for task in asyncio.as_completed(tasks):
-                url, album_data, status = await task
-                if album_data:
-                    albums.append(album_data)
-                elif status:
-                    failures.append((url, status))
-                    if result_callback:
-                        result_callback(url, status)
+        with optional_progress(
+            show_progress,
+            total=len(tasks),
+            desc=f"[{label}] album scan",
+            unit="album",
+            **progress_options("YELLOW", leave=False),
+        ) as scan_progress:
+            await drain_tasks(tasks, on_scanned, scan_progress)
 
     if failures:
         banned_count = sum(status == "banned" for _, status in failures)
@@ -1314,24 +1367,7 @@ async def collect_album_data_batch(
 
 async def collect_account_album_urls(account_url: str) -> list[str]:
     account_url = normalize_account_url(account_url)
-    timeout = ClientTimeout(
-        total=None,
-        connect=CONNECT_TIMEOUT,
-        sock_connect=CONNECT_TIMEOUT,
-        sock_read=IDLE_TIMEOUT,
-    )
-    connector = TCPConnector(
-        limit=ACCOUNT_PAGE_CONNECTIONS,
-        limit_per_host=ACCOUNT_PAGE_CONNECTIONS,
-        ttl_dns_cache=300,
-    )
-    headers = {"User-Agent": USER_AGENT}
-
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers=headers,
-        timeout=timeout,
-    ) as session:
+    async with make_session(ACCOUNT_PAGE_CONNECTIONS) as session:
         first_html = await _fetch_text_page(session, account_url, "account page")
         album_urls, page_numbers = parse_account_html(
             first_html,
@@ -1357,20 +1393,19 @@ async def collect_account_album_urls(account_url: str) -> list[str]:
             )
             for page_url in page_urls
         ]
+        def on_page(item: tuple[str, list[str]] | Exception) -> None:
+            if isinstance(item, Exception):
+                log_warn(f"account page: {friendly_error(item)}")
+            else:
+                album_urls.extend(item[1])
+
         with tqdm(
             total=len(tasks),
             desc=f"[{account_name_from_url(account_url)}] pages",
             unit="page",
             **progress_options("YELLOW", leave=False),
         ) as pages_progress:
-            for task in asyncio.as_completed(tasks):
-                try:
-                    _, page_albums = await task
-                    album_urls.extend(page_albums)
-                except AlbumFetchError as error:
-                    log_warn(f"account page: {friendly_error(error)}")
-                finally:
-                    pages_progress.update(1)
+            await drain_tasks(tasks, on_page, pages_progress)
 
     return dedupe_preserve_order(album_urls)
 
@@ -1534,19 +1569,8 @@ async def dump_account(
         )
         return "success"
 
-    def mark_album_result(album_url: str, result: str, failed_is_final: bool) -> None:
-        if result == "success":
-            set_status(album_url, "ready")
-        elif result == "banned":
-            set_status(album_url, "banned")
-        elif failed_is_final:
-            set_status(album_url, "failed")
-
-    def mark_album_initial_result(album_url: str, result: str) -> None:
-        mark_album_result(album_url, result, failed_is_final=False)
-
-    def mark_album_final_result(album_url: str, result: str) -> None:
-        mark_album_result(album_url, result, failed_is_final=True)
+    mark_album_initial_result = result_marker(set_status, failed_is_final=False)
+    mark_album_final_result = result_marker(set_status, failed_is_final=True)
 
     results = await download_links_parallel(
         urls=pending_album_urls,
@@ -1626,23 +1650,7 @@ async def _download(
         return DownloadSummary(results=[])
 
     max_connections = max(1, min(max_connections, len(jobs), 32))
-    timeout = ClientTimeout(
-        total=None,
-        connect=CONNECT_TIMEOUT,
-        sock_connect=CONNECT_TIMEOUT,
-        sock_read=IDLE_TIMEOUT,
-    )
-    connector = TCPConnector(
-        limit=max_connections,
-        limit_per_host=max_connections,
-        ttl_dns_cache=300,
-    )
-    headers = {
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-        "Referer": album,
-        "User-Agent": USER_AGENT,
-    }
+    headers = {"Accept": "*/*", "Connection": "keep-alive", "Referer": album}
 
     results: list[DownloadResult] = []
     semaphore = asyncio.Semaphore(max_connections)
@@ -1652,11 +1660,12 @@ async def _download(
         for position in range(1, max_connections + 1):
             progress_slots.put_nowait(position)
 
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers=headers,
-        timeout=timeout,
-    ) as session:
+    def on_result(result: DownloadResult) -> None:
+        results.append(result)
+        if file_result_callback:
+            file_result_callback(result)
+
+    async with make_session(max_connections, headers) as session:
         tasks = [
             asyncio.create_task(
                 _download_file(
@@ -1671,25 +1680,14 @@ async def _download(
             )
             for job in jobs
         ]
-        if show_progress:
-            with tqdm(
-                total=len(tasks),
-                desc=desc,
-                unit="file",
-                **progress_options("MAGENTA", leave=True, position=0),
-            ) as album_progress:
-                for task in asyncio.as_completed(tasks):
-                    result = await task
-                    results.append(result)
-                    if file_result_callback:
-                        file_result_callback(result)
-                    album_progress.update(1)
-        else:
-            for task in asyncio.as_completed(tasks):
-                result = await task
-                results.append(result)
-                if file_result_callback:
-                    file_result_callback(result)
+        with optional_progress(
+            show_progress,
+            total=len(tasks),
+            desc=desc,
+            unit="file",
+            **progress_options("MAGENTA", leave=True, position=0),
+        ) as album_progress:
+            await drain_tasks(tasks, on_result, album_progress)
 
     summary = DownloadSummary(results=results)
     record_file_results(album, download_path, results)
@@ -1906,59 +1904,10 @@ async def _collect_album_data(
     skip_videos: bool,
     skip_images: bool,
 ) -> AlbumData:
-    timeout = ClientTimeout(
-        total=None,
-        connect=CONNECT_TIMEOUT,
-        sock_connect=CONNECT_TIMEOUT,
-        sock_read=IDLE_TIMEOUT,
-    )
-    connector = TCPConnector(limit=2, limit_per_host=2, ttl_dns_cache=300)
-    headers = {"User-Agent": USER_AGENT}
-    last_error = ""
-
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers=headers,
-        timeout=timeout,
-    ) as session:
-        for attempt in range(1, PAGE_ATTEMPTS + 1):
-            try:
-                async with session.get(url) as response:
-                    if response.status in UNAVAILABLE_STATUSES:
-                        raise AlbumFetchError(
-                            f"HTTP {response.status}",
-                            status=response.status,
-                        )
-                    if response.status in RETRYABLE_STATUSES:
-                        raise DownloadError(f"HTTP {response.status}")
-                    if not response.ok:
-                        raise AlbumFetchError(
-                            f"HTTP {response.status}",
-                            status=response.status,
-                        )
-
-                    html_content = await response.text(errors="replace")
-                    return parse_album_html_data(
-                        html_content,
-                        base_url=url,
-                        album_url=url,
-                        skip_videos=skip_videos,
-                        skip_images=skip_images,
-                    )
-            except AlbumFetchError:
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError, DownloadError) as error:
-                last_error = str(error) or error.__class__.__name__
-                if attempt < PAGE_ATTEMPTS:
-                    delay = min(2 ** (attempt - 1), 8)
-                    log_retry_unless_quiet(
-                        f"album page: {friendly_error(last_error)} "
-                        f"({attempt}/{PAGE_ATTEMPTS}), пауза {delay}s",
-                        last_error,
-                    )
-                    await asyncio.sleep(delay)
-
-    raise AlbumFetchError(last_error or "не удалось получить страницу альбома")
+    async with make_session(2) as session:
+        return await _collect_album_data_with_session(
+            session, url, skip_videos, skip_images
+        )
 
 
 def parse_album_html_data(
@@ -2001,22 +1950,6 @@ def parse_album_html_data(
         video_urls=video_urls,
         image_urls=image_urls,
     )
-
-
-def parse_album_html(
-    html_content: str,
-    base_url: str,
-    skip_videos: bool,
-    skip_images: bool,
-) -> tuple[str, list[str]]:
-    album_data = parse_album_html_data(
-        html_content,
-        base_url=base_url,
-        album_url=base_url,
-        skip_videos=skip_videos,
-        skip_images=skip_images,
-    )
-    return album_data.title, album_data.urls
 
 
 def ask_mode() -> str:
@@ -2411,22 +2344,15 @@ async def batch_download(
         "START",
     )
 
-    def mark_result(url: str, result: str, failed_is_final: bool) -> None:
-        if result == "success":
-            set_download_status(url, "ready")
-            pending_queue.remove(url)
-        elif result == "banned":
-            set_download_status(url, "banned")
-            pending_queue.remove(url)
-        elif failed_is_final:
-            set_download_status(url, "failed")
-            pending_queue.remove(url)
+    def forget_pending(url: str) -> None:
+        pending_queue.remove(url)
 
-    def mark_initial_result(url: str, result: str) -> None:
-        mark_result(url, result, failed_is_final=False)
-
-    def mark_final_result(url: str, result: str) -> None:
-        mark_result(url, result, failed_is_final=True)
+    mark_initial_result = result_marker(
+        set_download_status, failed_is_final=False, after=forget_pending
+    )
+    mark_final_result = result_marker(
+        set_download_status, failed_is_final=True, after=forget_pending
+    )
 
     regular_results = await download_links_parallel(
         urls=regular_links,
@@ -2479,14 +2405,7 @@ async def batch_download_accounts(
     skip_images: bool,
     sort_links: bool,
 ) -> None:
-    account_links = [
-        normalize_account_url(link)
-        for link in links
-        if link.strip()
-        and not link.strip().startswith("#")
-        and is_erome_account_url(normalize_download_url(link))
-    ]
-    account_links = dedupe_preserve_order(account_links)
+    account_links = prepare_account_links(links)
 
     if sort_links:
         account_links = sort_download_links(account_links)
@@ -2523,14 +2442,7 @@ async def scan_accounts_to_pending(
     links: Iterable[str],
     sort_links: bool,
 ) -> None:
-    account_links = [
-        normalize_account_url(link)
-        for link in links
-        if link.strip()
-        and not link.strip().startswith("#")
-        and is_erome_account_url(normalize_download_url(link))
-    ]
-    account_links = dedupe_preserve_order(account_links)
+    account_links = prepare_account_links(links)
     if sort_links:
         account_links = sort_download_links(account_links)
 
