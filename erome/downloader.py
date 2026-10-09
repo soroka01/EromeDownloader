@@ -5,7 +5,6 @@ from typing import Callable, Iterable
 
 import aiofiles
 import aiohttp
-from tqdm import tqdm
 
 from erome.config import (
     CHUNK_SIZE,
@@ -15,7 +14,6 @@ from erome.config import (
     UNAVAILABLE_STATUSES,
 )
 from erome.console import (
-    format_bytes,
     friendly_error,
     is_quiet_retry_error,
     log,
@@ -23,9 +21,7 @@ from erome.console import (
     log_retry_unless_quiet,
     log_success,
     log_warn,
-    progress_options,
     short_url,
-    shorten_text,
 )
 from erome.models import (
     DownloadError,
@@ -42,7 +38,21 @@ from erome.net import (
     parse_content_range_total,
 )
 from erome.storage import ensure_runtime_dirs, record_file_results
+from erome.ui import human_size
 from erome.urls import build_download_jobs
+
+
+def _chain_bytes(
+    first: Callable[[int], None], second: Callable[[int], None] | None
+) -> Callable[[int], None]:
+    if second is None:
+        return first
+
+    def both(count: int) -> None:
+        first(count)
+        second(count)
+
+    return both
 
 
 async def _download(
@@ -50,7 +60,7 @@ async def _download(
     urls: Iterable[str],
     max_connections: int,
     download_path: Path,
-    desc: str = "Album",
+    desc: str = "Альбом",
     show_progress: bool = True,
     show_summary: bool = True,
     byte_progress: Callable[[int], None] | None = None,
@@ -68,11 +78,6 @@ async def _download(
 
     results: list[DownloadResult] = []
     semaphore = asyncio.Semaphore(max_connections)
-    progress_slots: asyncio.Queue[int] | None = None
-    if show_progress:
-        progress_slots = asyncio.Queue()
-        for position in range(1, max_connections + 1):
-            progress_slots.put_nowait(position)
 
     def on_result(result: DownloadResult) -> None:
         results.append(result)
@@ -80,27 +85,28 @@ async def _download(
             file_result_callback(result)
 
     async with make_session(max_connections, headers) as session:
-        tasks = [
-            asyncio.create_task(
-                _download_file(
-                    session,
-                    job,
-                    semaphore,
-                    show_progress=show_progress,
-                    progress_slots=progress_slots,
-                    show_messages=show_summary,
-                    byte_progress=byte_progress,
-                )
-            )
-            for job in jobs
-        ]
         with optional_progress(
             show_progress,
-            total=len(tasks),
-            desc=desc,
-            unit="file",
-            **progress_options("MAGENTA", leave=True, position=0),
+            label=desc,
+            total=len(jobs),
+            unit="файлов",
         ) as album_progress:
+            on_bytes = byte_progress
+            if album_progress is not None:
+                on_bytes = _chain_bytes(album_progress.add_bytes, byte_progress)
+
+            tasks = [
+                asyncio.create_task(
+                    _download_file(
+                        session,
+                        job,
+                        semaphore,
+                        show_messages=show_summary,
+                        byte_progress=on_bytes,
+                    )
+                )
+                for job in jobs
+            ]
             await drain_tasks(tasks, on_result, album_progress)
 
     summary = DownloadSummary(results=results)
@@ -108,15 +114,15 @@ async def _download(
     if show_summary:
         if summary.failed_count or summary.banned_count:
             log_warn(
-                f"ok={summary.ok_count}/{summary.total}, "
-                f"failed={summary.failed_count}, "
-                f"banned={summary.banned_count}, "
-                f"size={format_bytes(summary.total_size)}"
+                f"готово {summary.ok_count}/{summary.total}, "
+                f"ошибок {summary.failed_count}, "
+                f"недоступно {summary.banned_count}, "
+                f"{human_size(summary.total_size)}"
             )
         else:
             log_success(
                 f"{download_path.name}: {summary.ok_count}/{summary.total} файлов, "
-                f"{format_bytes(summary.total_size)}"
+                f"{human_size(summary.total_size)}"
             )
     return summary
 
@@ -125,8 +131,6 @@ async def _download_file(
     session: aiohttp.ClientSession,
     job: FileJob,
     semaphore: asyncio.Semaphore,
-    show_progress: bool,
-    progress_slots: asyncio.Queue[int] | None,
     show_messages: bool,
     byte_progress: Callable[[int], None] | None,
 ) -> DownloadResult:
@@ -136,23 +140,14 @@ async def _download_file(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             async with semaphore:
-                progress_position = None
-                if show_progress and progress_slots is not None:
-                    progress_position = await progress_slots.get()
-                try:
-                    return await _download_file_once(
-                        session,
-                        job,
-                        part_path,
-                        attempt,
-                        show_progress=show_progress,
-                        progress_position=progress_position,
-                        show_messages=show_messages,
-                        byte_progress=byte_progress,
-                    )
-                finally:
-                    if progress_position is not None and progress_slots is not None:
-                        progress_slots.put_nowait(progress_position)
+                return await _download_file_once(
+                    session,
+                    job,
+                    part_path,
+                    attempt,
+                    show_messages=show_messages,
+                    byte_progress=byte_progress,
+                )
         except DownloadError as error:
             last_error = str(error)
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
@@ -183,8 +178,6 @@ async def _download_file_once(
     job: FileJob,
     part_path: Path,
     attempt: int,
-    show_progress: bool,
-    progress_position: int | None,
     show_messages: bool,
     byte_progress: Callable[[int], None] | None,
 ) -> DownloadResult:
@@ -209,7 +202,7 @@ async def _download_file_once(
                 part_path.replace(job.path)
                 size = job.path.stat().st_size if job.path.exists() else total_size
                 if show_messages:
-                    log_success(f"{job.path.name} докачан ранее ({format_bytes(size)})")
+                    log_success(f"{job.path.name} докачан ранее ({human_size(size)})")
                 return DownloadResult(
                     job.url,
                     "success",
@@ -238,21 +231,19 @@ async def _download_file_once(
 
         if resume_from and response.status == 206:
             mode = "ab"
-            initial_size = resume_from
             total_size = remote_total or resume_from + content_length
         else:
             if resume_from and response.status == 200:
                 if show_messages:
                     log(f"{job.path.name}: сервер не дал докачку, перекачиваю")
             mode = "wb"
-            initial_size = 0
             total_size = content_length
 
         if job.path.exists() and total_size and job.path.stat().st_size == total_size:
             if part_path.exists():
                 part_path.unlink()
             if show_messages:
-                log_success(f"{job.path.name} уже скачан ({format_bytes(total_size)})")
+                log_success(f"{job.path.name} уже скачан ({human_size(total_size)})")
             return DownloadResult(
                 job.url,
                 "skipped",
@@ -261,40 +252,18 @@ async def _download_file_once(
                 size_bytes=total_size,
             )
 
-        progress_total = total_size or None
-        progress = None
-        if show_progress:
-            progress = tqdm(
-                desc=shorten_text(f"[{job.path.parent.name}] {job.path.name}", 56),
-                total=progress_total,
-                initial=initial_size,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                **progress_options(
-                    "CYAN",
-                    leave=False,
-                    position=progress_position,
-                ),
-            )
-        try:
-            last_data_time = time.monotonic()
-            async with aiofiles.open(part_path, mode) as file:
-                async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                    now = time.monotonic()
-                    if now - last_data_time > IDLE_TIMEOUT:
-                        raise asyncio.TimeoutError("нет данных слишком долго")
-                    if not chunk:
-                        continue
-                    await file.write(chunk)
-                    last_data_time = now
-                    if byte_progress is not None:
-                        byte_progress(len(chunk))
-                    if progress is not None:
-                        progress.update(len(chunk))
-        finally:
-            if progress is not None:
-                progress.close()
+        last_data_time = time.monotonic()
+        async with aiofiles.open(part_path, mode) as file:
+            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                now = time.monotonic()
+                if now - last_data_time > IDLE_TIMEOUT:
+                    raise asyncio.TimeoutError("нет данных слишком долго")
+                if not chunk:
+                    continue
+                await file.write(chunk)
+                last_data_time = now
+                if byte_progress is not None:
+                    byte_progress(len(chunk))
 
         downloaded_size = part_path.stat().st_size if part_path.exists() else 0
         if total_size and downloaded_size < total_size:

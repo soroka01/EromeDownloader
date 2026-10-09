@@ -150,13 +150,4 @@ STATUS_FILES = ("ready", "failed", "banned")
 ACCOUNT_STATUS_FILES = ("ready_accs", "failed_accs", "banned_accs")
 
 
-BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
-
-
-GROUP_BAR_FORMAT = "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}, {rate_fmt}{postfix}]"
-
-
-MAX_PROGRESS_WIDTH = 112
-
-
 MAX_LOG_MESSAGE = 180

@@ -7,8 +7,6 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
 from bs4 import BeautifulSoup
-from colorama import Fore
-from tqdm import tqdm
 
 from erome.config import (
     ACCOUNT_MAX_PAGES,
@@ -26,14 +24,15 @@ from erome.config import (
     USER_AGENT,
 )
 from erome.console import (
-    format_bytes,
+    LiveProgress,
     friendly_error,
     log,
+    log_hint,
     log_retry_unless_quiet,
     log_warn,
-    progress_options,
     short_url,
 )
+from erome.ui import human_size
 from erome.models import AlbumData, AlbumFetchError, DownloadError, DownloadResultCallback
 from erome.urls import (
     _clean_album_title,
@@ -82,7 +81,7 @@ async def drain_tasks(tasks: list[asyncio.Task], on_result=None, progress=None) 
 
 
 def optional_progress(enabled: bool, **kwargs):
-    return tqdm(**kwargs) if enabled else nullcontext()
+    return LiveProgress(**kwargs) if enabled else nullcontext()
 
 
 def parse_content_length(headers) -> int:
@@ -166,8 +165,8 @@ def album_size_text(album: AlbumData) -> str:
     if album.size_bytes is None:
         return "размер неизвестен"
     if album.unknown_size_count:
-        return f">= {format_bytes(album.size_bytes)}"
-    return format_bytes(album.size_bytes)
+        return f">= {human_size(album.size_bytes)}"
+    return human_size(album.size_bytes)
 
 
 async def estimate_album_sizes_batch(
@@ -194,11 +193,9 @@ async def estimate_album_sizes_batch(
     )
     semaphore = asyncio.Semaphore(probe_connections)
 
-    log(
+    log_hint(
         f"{label}: оцениваю вес {len(albums)} альбомов "
-        f"({media_count} файлов, {probe_connections} соединения)",
-        Fore.CYAN,
-        "SIZE",
+        f"({media_count} файлов, {probe_connections} соединения)"
     )
     async with make_session(
         probe_connections, {"Accept": "*/*"}, probe_timeout
@@ -209,10 +206,9 @@ async def estimate_album_sizes_batch(
         ]
         with optional_progress(
             show_progress,
+            label=f"{label}: оценка веса",
             total=len(tasks),
-            desc=f"[{label}] size scan",
-            unit="album",
-            **progress_options("YELLOW", leave=False),
+            unit="альбомов",
         ) as size_progress:
             await drain_tasks(tasks, progress=size_progress)
 
@@ -231,12 +227,10 @@ async def estimate_album_sizes_batch(
             (album for album in albums if album.has_full_size),
             key=lambda album: album.size_bytes or 0,
         )
-        log(
+        log_hint(
             f"{label}: известен вес {full_count}/{len(albums)}, "
             f"частично {partial_count}, неизвестно {unknown_count}; "
-            f"меньший {album_size_text(smallest)}, больший {album_size_text(largest)}",
-            Fore.CYAN,
-            "SIZE",
+            f"меньший {album_size_text(smallest)}, больший {album_size_text(largest)}"
         )
     elif partial_count:
         log_warn(
@@ -392,10 +386,9 @@ async def collect_album_data_batch(
         tasks = [asyncio.create_task(collect_one(url)) for url in album_urls]
         with optional_progress(
             show_progress,
+            label=f"{label}: чтение альбомов",
             total=len(tasks),
-            desc=f"[{label}] album scan",
-            unit="album",
-            **progress_options("YELLOW", leave=False),
+            unit="альбомов",
         ) as scan_progress:
             await drain_tasks(tasks, on_scanned, scan_progress)
 
@@ -423,18 +416,14 @@ async def collect_album_data_batch(
     video_or_mixed = len(albums) - photo_only
     if albums:
         if estimate_sizes and any(album.size_bytes is not None for album in albums):
-            log(
+            log_hint(
                 f"{label}: сортировка по весу; "
-                f"фото-only {photo_only}, с видео/смешанных {video_or_mixed}",
-                Fore.CYAN,
-                "SORT",
+                f"фото-only {photo_only}, с видео/смешанных {video_or_mixed}"
             )
         else:
-            log(
+            log_hint(
                 f"{label}: фото-only {photo_only}, "
-                f"с видео/смешанных {video_or_mixed}",
-                Fore.CYAN,
-                "SORT",
+                f"с видео/смешанных {video_or_mixed}"
             )
 
     return albums, failures
@@ -474,11 +463,10 @@ async def collect_account_album_urls(account_url: str) -> list[str]:
             else:
                 album_urls.extend(item[1])
 
-        with tqdm(
+        with LiveProgress(
+            label=f"{account_name_from_url(account_url)}: страницы аккаунта",
             total=len(tasks),
-            desc=f"[{account_name_from_url(account_url)}] pages",
-            unit="page",
-            **progress_options("YELLOW", leave=False),
+            unit="страниц",
         ) as pages_progress:
             await drain_tasks(tasks, on_page, pages_progress)
 

@@ -11,7 +11,7 @@
 
 ## 📌 Overview
 
-The program downloads public Erome albums, individual files and new albums from accounts. It supports queues, parallel downloads, resuming and account tracking. The interface is a console menu; you pick a mode after launch.
+The program downloads public Erome albums, individual files and new albums from accounts. It supports queues, parallel downloads, resuming and account tracking. The interface is a console menu: after launch the main menu is shown and you pick a mode by number.
 
 > [!NOTE]
 > Erome authentication, cookies and private albums are not supported.
@@ -47,6 +47,13 @@ Modes:
 - Mode `1` writes to the manifest but does not maintain `ready.txt`, `failed.txt` and `banned.txt` as a batch queue.
 - Mode `3` always collects both images and videos: `skip_images` and `skip_videos` are not applied to it.
 - Mode `4` treats URLs from `ready`, `banned`, `failed` and `pending` as known, so a failed URL is not re-queued automatically.
+
+### Console controls
+
+- Main menu: `1`-`4` are the modes from the table above, `0` (or `q`, `exit`) quits. Empty input selects `1`. The menu is shown again after every action.
+- `Ctrl+C` interrupts the current action and returns to the menu; `.part` files and queues are kept, so unfinished work continues on the next run.
+- While running, a single progress line is updated at the bottom: links, albums and files processed, transferred size, speed and time left.
+- Hot keys (interactive console only, also work on a Russian keyboard layout): `S` - status, `P` - pause, `Q` - stop after the current item. Pause and stop take effect between items: queue links and albums, accounts; an album or file already in progress runs to completion. While downloading a single album or file (mode `1`) only `S` works. Unprocessed items stay in the queue.
 
 ## 🚀 Quick start
 
@@ -173,11 +180,12 @@ EromeDownloader/
 ├── requirements.txt   # dependencies
 ├── erome/
 │   ├── config.py      # settings loading
-│   ├── console.py     # console output
+│   ├── console.py     # logs, progress line, hot keys
 │   ├── downloader.py  # file downloading
 │   ├── models.py      # data models
 │   ├── net.py         # networking
 │   ├── storage.py     # queues, statuses, manifest
+│   ├── ui.py          # terminal UI: colours, status line, prompts
 │   ├── urls.py        # URL parsing and sorting
 │   └── workflow.py    # mode 1-4 workflows
 ├── downloads/         # downloaded files (not in Git)

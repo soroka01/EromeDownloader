@@ -1,32 +1,30 @@
 import asyncio
 from typing import Callable, Iterable
 
-from colorama import Fore
-from tqdm import tqdm
 
 from erome.config import (
     DOWNLOADS_DIR,
-    GROUP_BAR_FORMAT,
     SORT_ALBUMS_BY_SIZE,
     UNAVAILABLE_STATUSES,
 )
 from erome.console import (
-    DownloadSpeed,
+    LiveProgress,
+    checkpoint,
     friendly_error,
     log,
     log_auto,
     log_done,
     log_error,
+    log_hint,
     log_queue,
     log_result_summary,
     log_retry,
     log_skip,
     log_success,
     log_warn,
-    progress_options,
-    refresh_speed_postfix,
     short_url,
     shorten_text,
+    stop_requested,
 )
 from erome.downloader import _download
 from erome.models import (
@@ -102,7 +100,7 @@ async def dump(
             urls=[url],
             max_connections=1,
             download_path=DOWNLOADS_DIR,
-            desc="Direct file",
+            desc="Файл",
             show_progress=show_progress,
             show_summary=show_summary,
             byte_progress=byte_progress,
@@ -159,11 +157,9 @@ async def download_album_data(
         log(
             f"{shorten_text(album_data.title, 90)}: {album_data.media_count} файлов "
             f"({album_data.image_count} фото, {album_data.video_count} видео"
-            f"{size_info})",
-            Fore.CYAN,
-            "ALBUM",
+            f"{size_info})"
         )
-    desc = f"[{album_idx}/{album_total}] Album" if album_idx else "Album"
+    desc = f"[{album_idx}/{album_total}] Альбом" if album_idx else "Альбом"
     summary = await _download(
         album=album_data.url,
         urls=album_data.urls,
@@ -207,7 +203,7 @@ async def run_with_retry(
     banned = [url for url, result in results if result == "banned"]
     failed = [url for url, result in results if result == "failed"]
 
-    if failed:
+    if failed and not stop_requested():
         log_retry(retry_message(len(failed)))
         retry_results = await run(failed, retry_label, final_callback)
         banned += [url for url, result in retry_results if result == "banned"]
@@ -253,9 +249,7 @@ async def dump_account(
     log(
         f"{account_name}: найдено {len(album_urls)} постов, "
         f"новых к скачиванию {len(pending_album_urls)}, "
-        f"уже обработано {len(skipped_urls)}",
-        Fore.GREEN,
-        "ACCOUNT",
+        f"уже обработано {len(skipped_urls)}"
     )
 
     if not pending_album_urls:
@@ -282,9 +276,12 @@ async def dump_account(
         final_callback=mark_album_final_result,
     )
 
+    if stop_requested():
+        return "stopped"
+
     if failed_urls:
         log_warn(
-            f"{account_name}: failed={len(failed_urls)}, banned={len(banned_urls)}"
+            f"{account_name}: ошибок {len(failed_urls)}, недоступно {len(banned_urls)}"
         )
         record_account_manifest(
             account_url,
@@ -311,13 +308,13 @@ async def download_url_group_parallel(
     label: str,
     result_callback: DownloadResultCallback | None = None,
 ) -> list[tuple[str, str]]:
-    if not urls:
+    if not urls or stop_requested():
         return []
 
     parallel_items = min(len(urls), max_connections)
     total = len(urls)
     show_item_progress = total == 1 and parallel_items == 1
-    speed = DownloadSpeed()
+    progress = LiveProgress(label, total=total, unit="ссылок")
     log_queue(f"{label}: {total} ссылок")
     if parallel_items > 1:
         log_auto(
@@ -329,6 +326,8 @@ async def download_url_group_parallel(
 
     async def run_one(index: int, url: str) -> tuple[str, str]:
         async with semaphore:
+            if await checkpoint():
+                return url, "stopped"
             result = await dump(
                 url,
                 1,
@@ -338,7 +337,7 @@ async def download_url_group_parallel(
                 album_total=total,
                 show_progress=show_item_progress,
                 show_summary=show_item_progress,
-                byte_progress=None if show_item_progress else speed.add,
+                byte_progress=None if show_item_progress else progress.add_bytes,
             )
             return url, result
 
@@ -347,33 +346,22 @@ async def download_url_group_parallel(
         for index, url in enumerate(urls, 1)
     ]
     results: list[tuple[str, str]] = []
+
+    def accept(result: tuple[str, str]) -> None:
+        if result[1] == "stopped":
+            return  # not started: stays in the queue for the next run
+        results.append(result)
+        if result_callback:
+            result_callback(*result)
+
     if show_item_progress:
         for task in asyncio.as_completed(tasks):
-            result = await task
-            results.append(result)
-            if result_callback:
-                result_callback(*result)
+            accept(await task)
     else:
-        with tqdm(
-            total=total,
-            desc=label,
-            unit="file",
-            **progress_options("MAGENTA", leave=True, bar_format=GROUP_BAR_FORMAT),
-        ) as group_progress:
-            stop_speed = asyncio.Event()
-            speed_task = asyncio.create_task(
-                refresh_speed_postfix(group_progress, speed, stop_speed)
-            )
-            try:
-                for task in asyncio.as_completed(tasks):
-                    result = await task
-                    results.append(result)
-                    if result_callback:
-                        result_callback(*result)
-                    group_progress.update(1)
-            finally:
-                stop_speed.set()
-                await speed_task
+        with progress:
+            for task in asyncio.as_completed(tasks):
+                accept(await task)
+                progress.update(1)
     log_result_summary(label, results)
     return results
 
@@ -385,7 +373,7 @@ async def download_album_group_parallel(
     photo_mode: bool,
     result_callback: DownloadResultCallback | None = None,
 ) -> list[tuple[str, str]]:
-    if not albums:
+    if not albums or stop_requested():
         return []
 
     if photo_mode:
@@ -396,13 +384,22 @@ async def download_album_group_parallel(
     per_album_connections = per_album_connection_limit(max_connections, parallel_albums)
     total = len(albums)
     show_album_progress = total == 1
-    speed = DownloadSpeed()
     photo_only_total = sum(album.is_photo_only for album in albums)
     photo_only_remaining = photo_only_total
     total_files = sum(album.media_count for album in albums)
     album_by_url = {album.url: album for album in albums}
-    file_progress_ref: dict[str, tqdm | None] = {"bar": None}
     album_file_done: dict[str, int] = {album.url: 0 for album in albums}
+    progress = LiveProgress(
+        label,
+        total=total,
+        unit="альбомов",
+        total_bytes=(
+            sum(album.size_bytes or 0 for album in albums)
+            if all(album.has_full_size for album in albums)
+            else 0
+        ),
+    )
+    progress.files_total = total_files
 
     photo_text = (
         f", фото-only {photo_only_total}"
@@ -425,18 +422,16 @@ async def download_album_group_parallel(
     async def run_one(index: int, album_data: AlbumData) -> tuple[str, str]:
         async with semaphore:
             def on_file_done(_: DownloadResult) -> None:
-                file_progress = file_progress_ref["bar"]
-                if file_progress is None:
-                    return
                 album_file_done[album_data.url] += 1
                 done = album_file_done[album_data.url]
-                file_progress.set_postfix_str(
+                progress.note = (
                     f"{done}/{album_data.media_count} "
-                    f"{shorten_text(album_data.title, 30)}",
-                    refresh=False,
+                    f"{shorten_text(album_data.title, 30)}"
                 )
-                file_progress.update(1)
+                progress.add_file()
 
+            if await checkpoint():
+                return album_data.url, "stopped"
             result = await download_album_data(
                 album_data=album_data,
                 max_connections=per_album_connections,
@@ -444,22 +439,31 @@ async def download_album_group_parallel(
                 album_total=total,
                 show_progress=show_album_progress,
                 show_summary=show_album_progress,
-                byte_progress=None if show_album_progress else speed.add,
+                byte_progress=None if show_album_progress else progress.add_bytes,
                 file_result_callback=None if show_album_progress else on_file_done,
             )
             return album_data.url, result
 
     results: list[tuple[str, str]] = []
+
+    def accept(result: tuple[str, str]) -> None:
+        nonlocal photo_only_remaining
+        if result[1] == "stopped":
+            return  # not started: stays in the queue for the next run
+        results.append(result)
+        if result_callback:
+            result_callback(*result)
+        album = album_by_url.get(result[0])
+        if album and album.is_photo_only:
+            photo_only_remaining -= 1
+
+    tasks = [
+        asyncio.create_task(run_one(index, album_data))
+        for index, album_data in enumerate(albums, 1)
+    ]
     if show_album_progress:
-        tasks = [
-            asyncio.create_task(run_one(index, album_data))
-            for index, album_data in enumerate(albums, 1)
-        ]
         for task in asyncio.as_completed(tasks):
-            result = await task
-            results.append(result)
-            if result_callback:
-                result_callback(*result)
+            accept(await task)
     else:
         def album_extra_status() -> str:
             if not photo_only_total:
@@ -467,55 +471,11 @@ async def download_album_group_parallel(
             done = photo_only_total - photo_only_remaining
             return f"фото-only {done}/{photo_only_total}, осталось {photo_only_remaining}"
 
-        with tqdm(
-            total=total,
-            desc=label,
-            unit="album",
-            **progress_options(
-                "MAGENTA",
-                leave=True,
-                position=0,
-                bar_format=GROUP_BAR_FORMAT,
-            ),
-        ) as group_progress, tqdm(
-            total=total_files,
-            desc=f"{label} files",
-            unit="file",
-            **progress_options(
-                "CYAN",
-                leave=True,
-                position=1,
-                bar_format=GROUP_BAR_FORMAT,
-            ),
-        ) as files_progress:
-            file_progress_ref["bar"] = files_progress
-            tasks = [
-                asyncio.create_task(run_one(index, album_data))
-                for index, album_data in enumerate(albums, 1)
-            ]
-            stop_speed = asyncio.Event()
-            speed_task = asyncio.create_task(
-                refresh_speed_postfix(
-                    group_progress,
-                    speed,
-                    stop_speed,
-                    extra_status=album_extra_status,
-                )
-            )
-            try:
-                for task in asyncio.as_completed(tasks):
-                    result = await task
-                    results.append(result)
-                    if result_callback:
-                        result_callback(*result)
-                    album = album_by_url.get(result[0])
-                    if album and album.is_photo_only:
-                        photo_only_remaining -= 1
-                    group_progress.update(1)
-            finally:
-                file_progress_ref["bar"] = None
-                stop_speed.set()
-                await speed_task
+        progress.extra = album_extra_status
+        with progress:
+            for task in asyncio.as_completed(tasks):
+                accept(await task)
+                progress.update(1)
     log_result_summary(label, results)
     return results
 
@@ -543,11 +503,9 @@ async def download_links_parallel(
     album_task = None
     if album_urls:
         if direct_urls and SORT_ALBUMS_BY_SIZE:
-            log(
+            log_hint(
                 f"{label}: в фоне готовлю {len(album_urls)} альбомов "
-                "к сортировке по весу",
-                Fore.CYAN,
-                "SIZE",
+                "к сортировке по весу"
             )
         album_task = asyncio.create_task(
             collect_album_data_batch(
@@ -644,11 +602,7 @@ async def batch_download(
     valid_links = prepare_download_links(links, sort_links=sort_links)
 
     if sort_links:
-        log(
-            "Ссылки отсортированы: файлы -> фото-альбомы -> видео -> аккаунты.",
-            Fore.CYAN,
-            "SORT",
-        )
+        log_hint("Ссылки отсортированы: файлы -> фото-альбомы -> видео -> аккаунты.")
 
     if not valid_links:
         log_warn("В links/pending.txt нет ссылок для скачивания.")
@@ -682,9 +636,7 @@ async def batch_download(
     pending_queue.flush()
     log(
         f"К скачиванию: {len(regular_links)} ссылок, "
-        f"аккаунтов: {len(account_links)}",
-        Fore.GREEN,
-        "START",
+        f"аккаунтов: {len(account_links)}"
     )
 
     def forget_pending(url: str) -> None:
@@ -710,16 +662,22 @@ async def batch_download(
     )
 
     for index, url in enumerate(account_links, 1):
-        log(f"{index}/{len(account_links)} {short_url(url)}", Fore.CYAN, "ACCOUNT")
+        if await checkpoint():
+            break
+        log(f"Аккаунт {index}/{len(account_links)}: {short_url(url)}")
         result = await dump_account(
             account_url=url,
             max_connections=max_connections,
             skip_videos=skip_videos,
             skip_images=skip_images,
         )
+        if result == "stopped":
+            break
         mark_final_result(url, result)
 
     pending_queue.flush()
+    if stop_requested():
+        log_warn("Остановлено по запросу: необработанное осталось в links/pending.txt")
 
 
 async def batch_download_accounts(
@@ -733,26 +691,28 @@ async def batch_download_accounts(
 
     if sort_links:
         account_links = sort_download_links(account_links)
-        log("Аккаунты отсортированы.", Fore.CYAN, "SORT")
+        log_hint("Аккаунты отсортированы.")
 
     if not account_links:
         log_warn("В links/accs.txt нет аккаунтов для отслеживания.")
         return
 
-    log(f"Проверяем {len(account_links)} аккаунтов", Fore.GREEN, "START")
+    log(f"Проверяем {len(account_links)} аккаунтов")
 
     for index, account_url in enumerate(account_links, 1):
-        log(
-            f"{index}/{len(account_links)} {short_url(account_url)}",
-            Fore.CYAN,
-            "ACCOUNT",
-        )
+        if await checkpoint():
+            log_warn("Остановлено по запросу: остальные аккаунты не проверены")
+            break
+        log(f"Аккаунт {index}/{len(account_links)}: {short_url(account_url)}")
         result = await dump_account(
             account_url=account_url,
             max_connections=max_connections,
             skip_videos=skip_videos,
             skip_images=skip_images,
         )
+        if result == "stopped":
+            log_warn("Остановлено по запросу: аккаунт будет проверен при следующем запуске")
+            break
 
         if result == "success":
             set_account_status(account_url, "ready")
@@ -783,6 +743,9 @@ async def scan_accounts_to_pending(
     log(f"Проверяю аккаунты без скачивания: {len(account_links)}")
 
     for index, account_url in enumerate(account_links, 1):
+        if await checkpoint():
+            log_warn("Остановлено по запросу: остальные аккаунты не проверены")
+            break
         account_name = account_name_from_url(account_url)
         log(f"[{index}/{len(account_links)}] {account_name}: сбор постов")
         try:

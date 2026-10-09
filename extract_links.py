@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+from erome.ui import ui
+
 
 ALBUM_URL_RE = re.compile(
     r"(https?://(?:www\.)?erome\.com/a/[^\s\"'<>?#]+)",
@@ -47,43 +49,43 @@ def extract_links(html_path, output_path=None):
 
 
 def main():
-    print("\n=== EromeDownloader Link Extractor ===\n")
+    ui.set_title("EromeDownloader: извлечение ссылок")
+    ui.title("EromeDownloader  ·  извлечение ссылок из закладок")
 
     html_files = sorted(Path(".").glob("bookmarks*.html"))
     if not html_files:
-        print("Не найдено bookmarks*.html в текущей папке.")
+        ui.line("  Не найдено bookmarks*.html в текущей папке.", "warn")
         return
 
-    print("Найдены файлы:")
+    ui.line("  Найдены файлы:")
     for index, path in enumerate(html_files, 1):
-        print(f"  [{index}] {path}")
+        ui.line(f"  {ui.paint(str(index), 'key')}  {path}")
 
     if len(html_files) == 1:
         selected_index = 1
     else:
         while True:
             try:
-                selected_index = int(input(f"Выберите файл [1-{len(html_files)}]: "))
+                selected_index = int(ui.ask(f"Выберите файл [1-{len(html_files)}]", "1"))
             except ValueError:
                 selected_index = 0
 
             if 1 <= selected_index <= len(html_files):
                 break
-            print("Некорректный выбор.")
+            ui.line("  Некорректный выбор.", "warn")
 
     html_path = html_files[selected_index - 1]
     default_output = Path("links") / "pending.txt"
-    print(f"\nСохранять ссылки в: {default_output}")
+    ui.field("Сохранить в", default_output)
 
-    confirm = input("Продолжить? (Y/n): ").strip().lower()
-    if confirm not in {"", "y", "yes", "д", "да"}:
+    if not ui.confirm("Продолжить? Содержимое файла будет заменено", default=True):
         return
 
     links = extract_links(html_path, default_output)
-    print(f"\nИзвлечено {len(links)} ссылок:")
+    ui.title(f"Извлечено ссылок: {len(links)}")
     for link in links:
-        print(link)
-    print(f"\nВсе ссылки сохранены в {default_output}")
+        ui.line(f"  {link}", "dim")
+    ui.line(f"  Все ссылки сохранены в {default_output}", "ok")
 
 
 if __name__ == "__main__":
