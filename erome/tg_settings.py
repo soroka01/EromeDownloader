@@ -15,28 +15,13 @@ SETTINGS_PATH = BASE_DIR / "telegram.json"
 EXAMPLE_PATH = BASE_DIR / "telegram.example.json"
 DEFAULT_SESSION_PATH = "data/telegram"
 PLACEHOLDER_PREFIX = "PUT_"
-# Values shipped in telegram.example.json: treated as "not filled in yet".
+# Values shipped in telegram.example.json (keep them in step with it): treated as "not filled in yet".
 PLACEHOLDER_CHAT_ID = -1001234567890
 PLACEHOLDER_OWNER_ID = 123456789
 BOT_TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,}$")
 
 DEFAULT_UPLOAD_CONNECTIONS = 12
 MAX_UPLOAD_CONNECTIONS = 24
-
-TEMPLATE: dict[str, Any] = {
-    "bot_token": "PUT_BOT_TOKEN_HERE",
-    "owner_ids": [PLACEHOLDER_OWNER_ID],
-    "account_id": None,
-    "chat_id": PLACEHOLDER_CHAT_ID,
-    "thread_id": 0,
-    "api_id": "PUT_API_ID_HERE",
-    "api_hash": "PUT_API_HASH_HERE",
-    "credentials_config_path": "",
-    "session_path": DEFAULT_SESSION_PATH,
-    "delete_after_upload": True,
-    "upload_connections": DEFAULT_UPLOAD_CONNECTIONS,
-}
-
 
 class SettingsError(Exception):
     """telegram.json is missing or incomplete; the message tells the user what to fix."""
@@ -96,16 +81,10 @@ def load_credentials(path: Path, visited: set[Path] | None = None) -> dict[str, 
 
 
 def ensure_settings_file() -> bool:
-    """Create telegram.json from the template when it does not exist yet. Returns True if it was created."""
+    """Create telegram.json from telegram.example.json when it does not exist yet. Returns True if it was created."""
     if SETTINGS_PATH.exists():
         return False
-    template = dict(TEMPLATE)
-    if EXAMPLE_PATH.exists():
-        try:
-            template = _read_json(EXAMPLE_PATH)
-        except SettingsError:
-            pass
-    write_text_atomic(SETTINGS_PATH, json.dumps(template, ensure_ascii=False, indent=2) + "\n")
+    write_text_atomic(SETTINGS_PATH, json.dumps(_read_json(EXAMPLE_PATH), ensure_ascii=False, indent=2) + "\n")
     return True
 
 
@@ -174,10 +153,10 @@ def _api_credentials(raw: dict[str, Any]) -> tuple[int, str]:
         raise SettingsError("api_id в telegram.json должен быть целым числом") from None
 
 
-def load_settings(*, need_token: bool = True) -> TelegramSettings:
+def load_settings() -> TelegramSettings:
     raw = read_raw()
     token = str(raw.get("bot_token") or "").strip()
-    if need_token and not (bot_token_is_set(raw) and valid_bot_token(token)):
+    if not (bot_token_is_set(raw) and valid_bot_token(token)):
         raise SettingsError("В telegram.json не задан токен бота (bot_token)")
 
     chat_id = _int_value(raw, "chat_id")

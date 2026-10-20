@@ -1,7 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import aiofiles
 import aiohttp
@@ -29,6 +29,7 @@ from erome.models import (
     DownloadSummary,
     FileJob,
     FileResultCallback,
+    Outcome,
 )
 from erome.net import (
     drain_tasks,
@@ -37,9 +38,9 @@ from erome.net import (
     parse_content_length,
     parse_content_range_total,
 )
-from erome.storage import ensure_runtime_dirs, record_file_results
+from erome.manifest import record_file_results
+from erome.storage import ensure_runtime_dirs
 from erome.ui import human_size
-from erome.urls import build_download_jobs
 
 
 def _chain_bytes(
@@ -53,30 +54,6 @@ def _chain_bytes(
         second(count)
 
     return both
-
-
-async def download_urls(
-    album: str,
-    urls: Iterable[str],
-    max_connections: int,
-    download_path: Path,
-    desc: str = "Альбом",
-    show_progress: bool = True,
-    show_summary: bool = True,
-    byte_progress: Callable[[int], None] | None = None,
-    file_result_callback: FileResultCallback | None = None,
-) -> DownloadSummary:
-    return await download_jobs(
-        album,
-        build_download_jobs(urls, download_path),
-        max_connections,
-        download_path,
-        desc=desc,
-        show_progress=show_progress,
-        show_summary=show_summary,
-        byte_progress=byte_progress,
-        file_result_callback=file_result_callback,
-    )
 
 
 async def download_jobs(
@@ -192,7 +169,7 @@ async def _download_file(
         log_error(f"{short_url(job.url)}: {friendly_error(last_error)}")
     return DownloadResult(
         url=job.url,
-        status="failed",
+        status=Outcome.FAILED,
         path=job.path,
         error=last_error,
         attempts=MAX_ATTEMPTS,
@@ -216,7 +193,7 @@ async def _download_file_once(
         if response.status in UNAVAILABLE_STATUSES:
             return DownloadResult(
                 url=job.url,
-                status="banned",
+                status=Outcome.BANNED,
                 path=job.path,
                 error=f"HTTP {response.status}",
                 attempts=attempt,
@@ -231,7 +208,7 @@ async def _download_file_once(
                     log_success(f"{job.path.name} докачан ранее ({human_size(size)})")
                 return DownloadResult(
                     job.url,
-                    "success",
+                    Outcome.SUCCESS,
                     job.path,
                     attempts=attempt,
                     size_bytes=size,
@@ -246,7 +223,7 @@ async def _download_file_once(
         if not response.ok and response.status != 206:
             return DownloadResult(
                 url=job.url,
-                status="failed",
+                status=Outcome.FAILED,
                 path=job.path,
                 error=f"HTTP {response.status}",
                 attempts=attempt,
@@ -272,7 +249,7 @@ async def _download_file_once(
                 log_success(f"{job.path.name} уже скачан ({human_size(total_size)})")
             return DownloadResult(
                 job.url,
-                "skipped",
+                Outcome.SKIPPED,
                 job.path,
                 attempts=attempt,
                 size_bytes=total_size,
@@ -301,7 +278,7 @@ async def _download_file_once(
         final_size = job.path.stat().st_size if job.path.exists() else downloaded_size
         return DownloadResult(
             job.url,
-            "success",
+            Outcome.SUCCESS,
             job.path,
             attempts=attempt,
             size_bytes=final_size,

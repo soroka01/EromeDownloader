@@ -1,8 +1,8 @@
 """The Telegram connection of the Telegram mode: one long-lived Telethon client and everything around it.
 
-The connection handling (supervisor, deadlines, extra upload connections, QR sign-in) is the one proven in the
-Webcam and Bigo recorders. `Transport` knows how to stay connected, how to make a request and how to move the bytes
-of a file; what is sent and how it is arranged into messages is the business of `Userbot` (tg_userbot.py).
+`Transport` knows how to stay connected (a supervisor with deadlines on every network step), how to make a request,
+how to move the bytes of a file over several connections and how to sign in by QR code; what is sent and how it is
+arranged into messages is the business of `Userbot` (tg_userbot.py).
 """
 from __future__ import annotations
 
@@ -260,7 +260,7 @@ def new_client(
 INVISIBLE_CHARS = dict.fromkeys(
     [0x115F, 0x1160, 0x3164, 0xFFA0, 0x2060, 0xFEFF, *range(0x200B, 0x2010)], None
 )
-MAX_NAME_LENGTH = 40
+DISPLAY_NAME_LIMIT = 40
 # What the legacy Windows console can draw with a predictable cell width: Latin, Greek, Cyrillic, common punctuation.
 RENDERABLE_RANGES = ((0x20, 0x24F), (0x370, 0x52F), (0x1E00, 0x1EFF), (0x2010, 0x2027), (0x2030, 0x205E), (0x20A0, 0x20BF))
 
@@ -270,7 +270,7 @@ def clean_text(text: str) -> str:
     text = " ".join(text.split())
     text = "".join(ch for ch in text if any(low <= ord(ch) <= high for low, high in RENDERABLE_RANGES))
     text = " ".join(text.split())
-    return text if len(text) <= MAX_NAME_LENGTH else text[: MAX_NAME_LENGTH - 1] + "…"
+    return text if len(text) <= DISPLAY_NAME_LIMIT else text[: DISPLAY_NAME_LIMIT - 1] + "…"
 
 
 def display_name(entity: Any) -> str:
@@ -315,7 +315,7 @@ class Transport:
         self.upload_connections = settings.upload_connections
         self._extra_senders: list[MTProtoSender] = []
         self._extra_owner: TelegramClient | None = None
-        self._extra_lock: asyncio.Lock | None = None
+        self._extra_lock = asyncio.Lock()
         self._extra_retry_at = 0.0
         self._lane_failures: list[float] = []
         self._lane_target = 0  # current size of the pool (0 = not chosen yet)
@@ -598,8 +598,6 @@ class Transport:
         wanted = self._effective_upload_connections() - 1
         if wanted <= 0:
             return []
-        if self._extra_lock is None:
-            self._extra_lock = asyncio.Lock()
         async with self._extra_lock:
             if self._extra_owner is not client:
                 await self._close_extra_senders()

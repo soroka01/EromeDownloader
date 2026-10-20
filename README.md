@@ -252,7 +252,8 @@ EromeDownloader/
 │   ├── downloader.py      # загрузка файлов
 │   ├── models.py          # модели данных
 │   ├── net.py             # сетевой слой
-│   ├── storage.py         # очереди, статусы, manifest
+│   ├── storage.py         # очереди и статус-файлы
+│   ├── manifest.py        # отчёт manifest.json
 │   ├── ui.py              # терминальный UI: цвета, строка статуса, ввод
 │   ├── urls.py            # разбор и сортировка URL
 │   ├── workflow.py        # сценарии режимов 1-4

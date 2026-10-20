@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import traceback
+from typing import Callable
 
 from erome.config import (
     AUTO_SORT_LINKS,
@@ -12,14 +13,16 @@ from erome.config import (
 )
 from erome.console import (
     configure_console,
-    log_done,
+    log,
     log_error,
+    log_success,
     log_warn,
     with_hotkeys,
 )
+from erome.manifest import flush_manifest
+from erome.models import Outcome
 from erome.storage import (
     ensure_runtime_dirs,
-    flush_manifest,
     read_accounts,
     read_pending,
     reset_queue_cache,
@@ -31,7 +34,7 @@ from erome.urls import choose_parallel_album_count
 from erome.workflow import (
     batch_download,
     batch_download_accounts,
-    dump,
+    download_link,
     scan_accounts_to_pending,
 )
 
@@ -98,14 +101,14 @@ def run_single_link() -> None:
         return
     result = asyncio.run(
         with_hotkeys(
-            dump(url, DEFAULT_MAX_CONNECTIONS, SKIP_VIDEOS, SKIP_IMAGES)
+            download_link(url, DEFAULT_MAX_CONNECTIONS, SKIP_VIDEOS, SKIP_IMAGES)
         )
     )
-    if result == "success":
-        log_done("Готово.")
-    elif result == "banned":
+    if result == Outcome.SUCCESS:
+        log_success("Готово.")
+    elif result == Outcome.BANNED:
         log_warn("Ссылка недоступна.")
-    elif result == "stopped":
+    elif result == Outcome.STOPPED:
         log_warn("Остановлено по запросу. Повторите ссылку: готовые альбомы будут пропущены.")
     else:
         log_error("Завершено с ошибкой.")
@@ -157,7 +160,7 @@ def run_telegram() -> None:
     run_telegram_bot()
 
 
-def attempt(action) -> None:
+def attempt(action: Callable[[], None]) -> None:
     """Run one menu action; failures and Ctrl+C return to the menu instead of closing the program."""
     reset_queue_cache()  # links/*.txt may have been edited by hand while the menu was open
     try:
@@ -205,4 +208,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        log_done("Остановлено пользователем.", "warn")
+        log("Остановлено пользователем.", "warn")

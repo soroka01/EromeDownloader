@@ -27,13 +27,14 @@ from aiogram.types import (
 )
 
 from erome.console import RunControl, log, log_warn
+from erome.models import LinkKind
 from erome.tg_pipeline import Pipeline, Progress
 from erome.tg_settings import TelegramSettings
-from erome.tg_state import CANCELLED, DONE, FAILED, PARTIAL, Job, TelegramState, canonical_url
+from erome.tg_state import CANCELLED, DONE, FAILED, PARTIAL, Job, TelegramState
 from erome.tg_transport import STATE_READY
 from erome.tg_userbot import Userbot
 from erome.ui import human_duration, human_size, plural
-from erome.urls import link_kind
+from erome.urls import link_kind, normalize_download_url
 
 LOG = logging.getLogger("erome.tg")
 
@@ -71,7 +72,7 @@ def attr(text: object) -> str:
     return esc(text).replace('"', "&quot;")
 
 
-def extract_links(message: Message) -> list[tuple[str, str]]:
+def extract_links(message: Message) -> list[tuple[LinkKind, str]]:
     """(kind, url) of every Erome album/profile link in a message, in order, without duplicates."""
     text = message.text or message.caption or ""
     candidates: list[str] = []
@@ -79,15 +80,15 @@ def extract_links(message: Message) -> list[tuple[str, str]]:
         if entity.type == "text_link" and entity.url:
             candidates.append(entity.url)
     candidates.extend(match.group(0) for match in _LINK_RE.finditer(text))
-    found: list[tuple[str, str]] = []
+    found: list[tuple[LinkKind, str]] = []
     seen: set[str] = set()
     for raw in candidates:
         raw = raw.strip().rstrip(_TRAILING)
         if not raw.lower().startswith("http"):
             raw = f"https://{raw}"
-        url = canonical_url(raw)
+        url = normalize_download_url(raw)
         kind = link_kind(url)
-        if kind in ("album", "account") and url not in seen:
+        if kind in (LinkKind.ALBUM, LinkKind.ACCOUNT) and url not in seen:
             seen.add(url)
             found.append((kind, url))
     return found
@@ -106,7 +107,7 @@ def link(title: str, url: str, limit: int = 60) -> str:
 
 
 def job_label(job: Job) -> str:
-    if job.kind == "account":
+    if job.kind == LinkKind.ACCOUNT:
         return link(job.title or "Профиль", job.url)
     return link(job.title or job.url.replace("https://", ""), job.url)
 
@@ -117,7 +118,6 @@ def count_text(count: int, one: str, few: str, many: str) -> str:
 
 def view_signature(text: str, markup: InlineKeyboardMarkup) -> tuple:
     return text, tuple(button.text for row in markup.inline_keyboard for button in row)
-
 
 
 # ----- the application --------------------------------------------------------------------------------
@@ -161,7 +161,7 @@ class BotApp:
         return self.pipeline.progress is not None or bool(self.pipeline.waiting)
 
     def activity_line(self, progress: Progress) -> str:
-        if progress.job.kind == "account":
+        if progress.job.kind == LinkKind.ACCOUNT:
             return "Читаю список альбомов профиля…"
         parts: list[str] = []
         if progress.files_total:
@@ -331,10 +331,6 @@ class BotApp:
             line += f" · {self.pipeline.waiting}"
         return line + tail
 
-    def status_text(self) -> str:
-        """Plain-text status for the S hot key."""
-        return self.console_line()
-
 
 # ----- handlers -----------------------------------------------------------------------------------------
 
@@ -360,13 +356,13 @@ def build_router(app: BotApp) -> Router:
         with contextlib.suppress(TelegramAPIError):
             await message.delete()
 
-    def enqueue(links: list[tuple[str, str]]) -> tuple[int, int, int]:
+    def enqueue(links: list[tuple[LinkKind, str]]) -> tuple[int, int, int]:
         """(albums added, profiles added, already queued) - the queue is saved to disk before this returns."""
         albums = profiles = duplicates = 0
         for kind, url in links:
             if app.pipeline.submit(kind, url) is None:
                 duplicates += 1
-            elif kind == "account":
+            elif kind == LinkKind.ACCOUNT:
                 profiles += 1
             else:
                 albums += 1
@@ -396,7 +392,7 @@ def build_router(app: BotApp) -> Router:
 
     @router.message(Command("resend"))
     async def on_resend(message: Message) -> None:
-        links = [item for item in extract_links(message) if item[0] == "album"]
+        links = [item for item in extract_links(message) if item[0] == LinkKind.ALBUM]
         if not links:
             app.set_notice("Укажите ссылку на альбом: <code>/resend https://www.erome.com/a/…</code>")
         else:

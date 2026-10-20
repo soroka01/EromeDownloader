@@ -1,7 +1,7 @@
 import asyncio
 import re
 from contextlib import nullcontext
-from typing import Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
@@ -31,7 +31,7 @@ from erome.console import (
     log_warn,
     short_url,
 )
-from erome.models import AlbumData, AlbumFetchError, DownloadError, DownloadResultCallback
+from erome.models import AlbumData, AlbumFetchError, DownloadError, DownloadResultCallback, Outcome
 from erome.ui import human_size
 from erome.urls import (
     account_name_from_url,
@@ -68,8 +68,12 @@ def make_session(
     )
 
 
-async def drain_tasks(tasks: list[asyncio.Task], on_result=None, progress=None) -> None:
-    """Ждёт задачи по мере завершения; при ошибке отменяет остальные."""
+async def drain_tasks(
+    tasks: list[asyncio.Task],
+    on_result: Callable[[Any], None] | None = None,
+    progress: LiveProgress | None = None,
+) -> None:
+    """Wait for the tasks as they finish; whatever the outcome, the ones still running are cancelled in the end."""
     try:
         for task in asyncio.as_completed(tasks):
             result = await task
@@ -349,20 +353,19 @@ async def collect_album_data_batch(
     urls: Iterable[str],
     skip_videos: bool,
     skip_images: bool,
-    sort_albums: bool,
     label: str,
     estimate_sizes: bool = False,
     show_progress: bool = True,
     result_callback: DownloadResultCallback | None = None,
-) -> tuple[list[AlbumData], list[tuple[str, str]]]:
+) -> tuple[list[AlbumData], list[tuple[str, Outcome]]]:
     album_urls = list(dedupe_preserve_order(urls))
     if not album_urls:
         return [], []
 
     albums: list[AlbumData] = []
-    failures: list[tuple[str, str]] = []
+    failures: list[tuple[str, Outcome]] = []
 
-    async def collect_one(url: str) -> tuple[str, AlbumData | None, str | None]:
+    async def collect_one(url: str) -> tuple[str, AlbumData | None, Outcome | None]:
         try:
             album_data = await _collect_album_data_with_session(
                 session,
@@ -372,10 +375,9 @@ async def collect_album_data_batch(
             )
             return url, album_data, None
         except AlbumFetchError as error:
-            status = "banned" if error.status in UNAVAILABLE_STATUSES else "failed"
-            return url, None, status
+            return url, None, error.outcome
 
-    def on_scanned(item: tuple[str, AlbumData | None, str | None]) -> None:
+    def on_scanned(item: tuple[str, AlbumData | None, Outcome | None]) -> None:
         url, album_data, status = item
         if album_data:
             albums.append(album_data)
@@ -395,12 +397,12 @@ async def collect_album_data_batch(
             await drain_tasks(tasks, on_scanned, scan_progress)
 
     if failures:
-        banned_count = sum(status == "banned" for _, status in failures)
-        failed_count = sum(status == "failed" for _, status in failures)
+        banned_count = sum(status == Outcome.BANNED for _, status in failures)
+        failed_count = sum(status == Outcome.FAILED for _, status in failures)
         if banned_count:
             log_warn(
                 f"{label}: недоступных альбомов {banned_count} "
-                "(404/410), помечаю как banned"
+                "(403/404/410), помечаю как banned"
             )
         if failed_count:
             log_warn(
@@ -411,8 +413,7 @@ async def collect_album_data_batch(
     if estimate_sizes:
         await estimate_album_sizes_batch(albums, label, show_progress=show_progress)
 
-    if sort_albums:
-        albums = sort_album_data(albums)
+    albums = sort_album_data(albums)
 
     photo_only = sum(album.is_photo_only for album in albums)
     video_or_mixed = len(albums) - photo_only

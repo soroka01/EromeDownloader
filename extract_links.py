@@ -10,7 +10,7 @@ from erome.urls import dedupe_preserve_order, is_erome_album_url, normalize_albu
 HREF_RE = re.compile(r"<a\s+[^>]*href=[\"']([^\"']+)[\"']", re.IGNORECASE)
 
 
-def extract_links(html_path, output_path=None):
+def extract_links(html_path: str | Path, output_path: str | Path | None = None) -> list[str]:
     html = Path(html_path).read_text(encoding="utf-8", errors="replace")
     links = []
 

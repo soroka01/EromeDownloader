@@ -22,7 +22,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
 from aiogram.types import BotCommand
 
 from erome.config import BASE_DIR
-from erome.console import RunControl, configure_console, hotkeys, log, log_done, log_error, log_success, log_warn
+from erome.console import RunControl, hotkeys, log, log_error, log_success, log_warn
 from erome.storage import ensure_runtime_dirs
 from erome.tg_bot import BotApp, build_router, count_text
 from erome.tg_pipeline import Pipeline
@@ -66,7 +66,6 @@ class TelegramControl(RunControl):
             self.stop = True
         else:
             super().handle(key)
-
 
 
 class InstanceLock:
@@ -244,7 +243,7 @@ async def serve(settings: TelegramSettings, control: TelegramControl) -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
     )
     app = BotApp(bot, state, pipeline, userbot, settings, control)
-    control.status = app.status_text
+    control.status = app.console_line
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(app))
 
@@ -331,23 +330,22 @@ def _ask_token() -> bool:
 
 def run_telegram_bot() -> None:
     """Menu entry: prepare settings and the userbot sign-in in the console, then run until stopped."""
-    configure_console()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     lock = InstanceLock(DATA_DIR / "telegram.lock")
     if not lock.acquire():
         log_error("Telegram-режим уже запущен в другом окне: закройте его или дождитесь остановки.")
         return
     try:
         configure_logging()
-        if ensure_settings_file():
-            log_warn(f"Создан файл {SETTINGS_PATH.name}: впишите в него chat_id, thread_id, owner_ids и учётные данные.")
         try:
+            if ensure_settings_file():
+                log_warn(f"Создан файл {SETTINGS_PATH.name}: впишите в него chat_id, thread_id, owner_ids и учётные данные.")
             if not bot_token_is_set(read_raw()) and not _ask_token():
                 return
             settings = load_settings()
         except SettingsError as exc:
             log_error(str(exc))
-            log(f"Файл настроек: {SETTINGS_PATH}", "dim")
+            if SETTINGS_PATH.exists():
+                log(f"Файл настроек: {SETTINGS_PATH}", "dim")
             return
         ui.idle()
         signed_in, info = sign_in_if_needed(settings, say=ui.line)
@@ -363,7 +361,7 @@ def run_telegram_bot() -> None:
         except SettingsError as exc:
             log_error(str(exc))
         else:
-            log_done("Telegram-режим остановлен. Очередь сохранена — продолжится при следующем запуске.")
+            log_success("Telegram-режим остановлен. Очередь сохранена — продолжится при следующем запуске.")
     finally:
         ui.idle()
         lock.release()

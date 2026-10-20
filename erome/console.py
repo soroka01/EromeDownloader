@@ -5,12 +5,13 @@ import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urlparse
 
-from erome.config import BASE_DIR, MAX_LOG_MESSAGE, RETRYABLE_STATUSES
+from erome.config import MAX_LOG_MESSAGE, RETRYABLE_STATUSES
+from erome.models import Outcome
 from erome.ui import BAR_WIDTH, human_duration, human_size, ui
 
 
@@ -21,22 +22,6 @@ def configure_console() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def format_bytes(size: int | float) -> str:
-    size = float(size or 0)
-    units = ("B", "KB", "MB", "GB", "TB")
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(size)} {unit}"
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} TB"
 
 
 class DownloadSpeed:
@@ -63,15 +48,6 @@ class DownloadSpeed:
         cutoff = now - self.window_seconds
         while self.samples and self.samples[0][0] < cutoff:
             self.samples.popleft()
-
-
-def relative_path(path: Path | None) -> str:
-    if not path:
-        return ""
-    try:
-        return str(path.resolve().relative_to(BASE_DIR))
-    except ValueError:
-        return str(path)
 
 
 def shorten_text(value: object, limit: int = 120) -> str:
@@ -165,28 +141,12 @@ def log_retry(message: str) -> None:
     log(message, "warn")
 
 
-def log_auto(message: str) -> None:
-    log_hint(message)
-
-
-def log_skip(message: str) -> None:
-    log_hint(message)
-
-
-def log_queue(message: str) -> None:
-    log_hint(message)
-
-
-def log_done(message: str, style: str | None = "ok") -> None:
-    log(message, style)
-
-
-def log_result_summary(label: str, results: list[tuple[str, str]]) -> None:
+def log_result_summary(label: str, results: list[tuple[str, Outcome]]) -> None:
     if not results:
         return
     total = len(results)
-    ok_count = sum(result == "success" for _, result in results)
-    banned_count = sum(result == "banned" for _, result in results)
+    ok_count = sum(result == Outcome.SUCCESS for _, result in results)
+    banned_count = sum(result == Outcome.BANNED for _, result in results)
     failed_count = total - ok_count - banned_count
     if failed_count or banned_count:
         log_warn(

@@ -14,7 +14,7 @@ import shutil
 import time
 from pathlib import Path
 
-from erome.config import DEFAULT_MAX_CONNECTIONS, DOWNLOADS_DIR, SKIP_IMAGES, SKIP_VIDEOS, UNAVAILABLE_STATUSES
+from erome.config import DEFAULT_MAX_CONNECTIONS, DOWNLOADS_DIR, SKIP_IMAGES, SKIP_VIDEOS
 from erome.console import (
     DownloadSpeed,
     checkpoint,
@@ -28,7 +28,7 @@ from erome.console import (
     stop_requested,
 )
 from erome.downloader import download_jobs
-from erome.models import AlbumData, AlbumFetchError, DownloadResult, FileJob
+from erome.models import AlbumData, AlbumFetchError, DownloadResult, FileJob, LinkKind, Outcome
 from erome.net import collect_account_album_urls, collect_album_data
 from erome.tg_media import SendItem, prepare_item
 from erome.tg_settings import TelegramSettings
@@ -85,19 +85,11 @@ class Progress:
         self.files_total = 0
         self.files_downloaded = 0
         self.files_sent = 0
-        self.bytes_downloaded = 0
-        self.bytes_uploaded = 0
         self.bytes_delivered = 0
-        self.download_speed = DownloadSpeed()
         self.upload_speed = DownloadSpeed()
         self.staging: Path | None = None
 
-    def add_download(self, count: int) -> None:
-        self.bytes_downloaded += count
-        self.download_speed.add(count)
-
     def add_upload(self, count: int) -> None:
-        self.bytes_uploaded += count
         self.upload_speed.add(count)
 
     def eta(self) -> float | None:
@@ -151,7 +143,7 @@ class Pipeline:
 
     # ----- control (called by the bot) ----------------------------------------------------------
 
-    def submit(self, kind: str, url: str) -> Job | None:
+    def submit(self, kind: LinkKind, url: str) -> Job | None:
         job = self.state.add(kind, url)
         if job is not None:
             self._wake.set()
@@ -261,7 +253,7 @@ class Pipeline:
             log_error(f"«{label}»: {note}")
 
     async def _run_job(self, job: Job) -> tuple[str, str] | None:
-        if job.kind == "account":
+        if job.kind == LinkKind.ACCOUNT:
             return await self._run_account(job)
         return await self._run_album(job)
 
@@ -276,7 +268,7 @@ class Pipeline:
         try:
             album_urls = await collect_account_album_urls(job.url, show_progress=False)
         except AlbumFetchError as error:
-            if error.status in UNAVAILABLE_STATUSES:
+            if error.unavailable:
                 raise JobFailed("профиль недоступен (удалён или закрыт)") from None
             if error.status is None:  # no answer or pages missing: the site may be fine in a few minutes
                 raise RetryJob(f"не удалось прочитать профиль: {friendly_error(error)}") from None
@@ -309,7 +301,7 @@ class Pipeline:
             try:
                 return await collect_album_data(job.url, SKIP_VIDEOS, SKIP_IMAGES)
             except AlbumFetchError as error:
-                if error.status in UNAVAILABLE_STATUSES:
+                if error.unavailable:
                     raise JobFailed("альбом недоступен (удалён или закрыт)") from None
                 last_error, last_status = friendly_error(error), error.status
             if attempt < SCAN_ATTEMPTS:
@@ -444,7 +436,6 @@ class Pipeline:
             staging,
             show_progress=False,
             show_summary=False,
-            byte_progress=progress.add_download,
             file_result_callback=on_file,
             record=False,
         )
@@ -468,7 +459,7 @@ class Pipeline:
                 self._failures.pop(item.url, None)
                 continue
             failed.append(item)
-            if result is not None and result.status == "banned":
+            if result is not None and result.status == Outcome.BANNED:
                 self._gone.add(item.url)
                 reason = f"файл недоступен на Erome ({result.error})"
             else:
@@ -578,7 +569,7 @@ class Pipeline:
             lasting = {
                 key: reason
                 for key, reason in refused.items()
-                if sizes.get(key, 0) > 0 and getattr(reason, "lasting", False)
+                if sizes.get(key, 0) > 0 and reason.lasting
             }
             if lasting:
                 self.state.record_refused(album.url, lasting, self.userbot.max_upload_bytes)
@@ -648,7 +639,7 @@ class Pipeline:
         """Remove staging folders of albums that are no longer queued (only when files are deleted after upload)."""
         if not self.settings.delete_after_upload or not self.staging.is_dir():
             return
-        live = {code_of(job.url) for job in self.state.queue if job.kind == "album"}
+        live = {code_of(job.url) for job in self.state.queue if job.kind == LinkKind.ALBUM}
         for folder in self.staging.iterdir():
             match = _STAGING_CODE_RE.search(folder.name)
             if folder.is_dir() and (match is None or match.group(1) not in live):

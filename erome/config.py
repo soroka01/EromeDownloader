@@ -1,6 +1,9 @@
 import json
 import re
+from datetime import datetime
 from pathlib import Path
+
+from erome.ui import ui
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +40,11 @@ DEFAULT_CONFIG = {
 }
 
 
+def _warn(text: str) -> None:
+    """Warn on the console. erome.console imports this module, so it cannot be used here; erome.ui can."""
+    ui.line(f"{datetime.now():%H:%M:%S}  Внимание: {text}", "warn")
+
+
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         try:
@@ -45,22 +53,22 @@ def load_config() -> dict:
                 encoding="utf-8",
             )
         except OSError as error:
-            print(f"[WARN] Не удалось создать config.json: {error}. Использую настройки по умолчанию.")
+            _warn(f"Не удалось создать config.json: {error}. Использую настройки по умолчанию.")
         return DEFAULT_CONFIG.copy()
 
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
-        print(f"[WARN] config.json не читается: {error}. Использую настройки по умолчанию.")
+        _warn(f"config.json не читается: {error}. Использую настройки по умолчанию.")
         return DEFAULT_CONFIG.copy()
 
     config = DEFAULT_CONFIG.copy()
     if not isinstance(loaded, dict):
-        print("[WARN] config.json должен быть JSON-объектом. Использую настройки по умолчанию.")
+        _warn("config.json должен быть JSON-объектом. Использую настройки по умолчанию.")
         return config
     for key in loaded:
         if key not in DEFAULT_CONFIG:
-            print(f"[WARN] config.json: неизвестный параметр «{key}» — игнорирую.")
+            _warn(f"config.json: неизвестный параметр «{key}» — игнорирую.")
     config.update(loaded)
     return config
 
@@ -69,7 +77,7 @@ CONFIG = load_config()
 
 
 def _int_setting(name: str, minimum: int, maximum: int) -> int:
-    """Целое из config.json: не число — значение по умолчанию, число вне диапазона — ближайшее допустимое."""
+    """An integer from config.json: a non-number falls back to the default, a number out of range to the nearest allowed one."""
     default = DEFAULT_CONFIG[name]
     value = CONFIG.get(name, default)
     try:
@@ -77,17 +85,17 @@ def _int_setting(name: str, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError, OverflowError):
         number = None
     if number is None:
-        print(f"[WARN] config.json: «{name}» = {value!r} не число. Использую {default}.")
+        _warn(f"config.json: «{name}» = {value!r} не число. Использую {default}.")
         return default
     if not minimum <= number <= maximum:
         nearest = min(max(number, minimum), maximum)
-        print(f"[WARN] config.json: «{name}» = {value!r} вне диапазона {minimum}…{maximum}. Использую {nearest}.")
+        _warn(f"config.json: «{name}» = {value!r} вне диапазона {minimum}…{maximum}. Использую {nearest}.")
         return nearest
     return number
 
 
 def _bool_setting(name: str) -> bool:
-    """true/false из config.json; строки вроде "false" и числа 0/1 тоже понимаются, остальное — по умолчанию."""
+    """A boolean from config.json; strings such as "false" and the numbers 0/1 are understood, anything else is the default."""
     default = DEFAULT_CONFIG[name]
     value = CONFIG.get(name, default)
     if isinstance(value, bool):
@@ -100,7 +108,7 @@ def _bool_setting(name: str) -> bool:
             return True
         if text in ("false", "no", "off", "0", "нет", "выкл"):
             return False
-    print(f"[WARN] config.json: «{name}» = {value!r} не подходит (нужно true или false). Использую {default}.")
+    _warn(f"config.json: «{name}» = {value!r} не подходит (нужно true или false). Использую {default}.")
     return default
 
 
@@ -109,7 +117,7 @@ def _path_setting(name: str) -> str:
     value = CONFIG.get(name, default)
     if isinstance(value, str) and value.strip():
         return value.strip()
-    print(f"[WARN] config.json: «{name}» = {value!r} не подходит (нужен путь). Использую {default}.")
+    _warn(f"config.json: «{name}» = {value!r} не подходит (нужен путь). Использую {default}.")
     return default
 
 

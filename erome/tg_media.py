@@ -6,6 +6,7 @@ blocking call runs in a worker thread so the event loop (bot polling, Telegram c
 from __future__ import annotations
 
 import asyncio
+import functools
 import mimetypes
 import os
 import re
@@ -29,9 +30,6 @@ _VIDEO_RE = re.compile(r"Stream #\d+:\d+.*?Video:.*?,\s*(\d{2,5})x(\d{2,5})")
 _ROTATION_RE = re.compile(r"rotation of (-?\d+(?:\.\d+)?) degrees")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
-
-_ffmpeg_path: str | None = None
-_ffmpeg_checked = False
 
 
 @dataclass(frozen=True)
@@ -64,17 +62,15 @@ class SendItem:
         return [path for path in (self.path, self.thumb) if path is not None]
 
 
+@functools.cache
 def ffmpeg_exe() -> str | None:
-    global _ffmpeg_path, _ffmpeg_checked
-    if not _ffmpeg_checked:
-        _ffmpeg_checked = True
-        try:
-            import imageio_ffmpeg
+    """Path of the ffmpeg binary bundled with imageio-ffmpeg (looked up once); None when it is not available."""
+    try:
+        import imageio_ffmpeg
 
-            _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            _ffmpeg_path = None
-    return _ffmpeg_path
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
 
 def _run_ffmpeg(args: list[str], timeout: int) -> subprocess.CompletedProcess[bytes] | None:

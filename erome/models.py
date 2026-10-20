@@ -1,9 +1,30 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Callable
 
+from erome.config import UNAVAILABLE_STATUSES
 
-DownloadResultCallback = Callable[[str, str], None]
+
+class Outcome(StrEnum):
+    """How a download of a file, an album or a link ended; the values are what the manifest and the logs show."""
+
+    SUCCESS = "success"
+    FAILED = "failed"
+    BANNED = "banned"  # the site says it is gone or closed
+    SKIPPED = "skipped"  # the file was already on disk
+    STOPPED = "stopped"  # not started: the user asked to stop
+
+
+class LinkKind(StrEnum):
+    """What a link points to; the values are also stored in the Telegram queue."""
+
+    DIRECT = "direct"  # a file (or anything that is not an Erome album or profile)
+    ALBUM = "album"
+    ACCOUNT = "account"  # a profile
+
+
+DownloadResultCallback = Callable[[str, Outcome], None]
 
 
 FileResultCallback = Callable[["DownloadResult"], None]
@@ -18,7 +39,7 @@ class FileJob:
 @dataclass(slots=True)
 class DownloadResult:
     url: str
-    status: str
+    status: Outcome
     path: Path | None = None
     error: str = ""
     attempts: int = 0
@@ -26,7 +47,7 @@ class DownloadResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in {"success", "skipped"}
+        return self.status in (Outcome.SUCCESS, Outcome.SKIPPED)
 
 
 @dataclass(slots=True)
@@ -43,24 +64,24 @@ class DownloadSummary:
 
     @property
     def failed_count(self) -> int:
-        return sum(result.status == "failed" for result in self.results)
+        return sum(result.status == Outcome.FAILED for result in self.results)
 
     @property
     def banned_count(self) -> int:
-        return sum(result.status == "banned" for result in self.results)
+        return sum(result.status == Outcome.BANNED for result in self.results)
 
     @property
     def total_size(self) -> int:
         return sum(result.size_bytes for result in self.results if result.ok)
 
-    def overall_status(self) -> str:
+    def overall_status(self) -> Outcome:
         if not self.results:
-            return "failed"
+            return Outcome.FAILED
         if self.failed_count == 0 and self.banned_count == 0:
-            return "success"
+            return Outcome.SUCCESS
         if self.ok_count == 0 and self.banned_count > 0:
-            return "banned"
-        return "failed"
+            return Outcome.BANNED
+        return Outcome.FAILED
 
 
 @dataclass(slots=True)
@@ -103,3 +124,13 @@ class AlbumFetchError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+    @property
+    def unavailable(self) -> bool:
+        """The site says the page is gone or closed (403, 404, 410), as opposed to a failure that may pass."""
+        return self.status in UNAVAILABLE_STATUSES
+
+    @property
+    def outcome(self) -> Outcome:
+        """How a link that could not be read ends: banned when the site says it is gone, failed otherwise."""
+        return Outcome.BANNED if self.unavailable else Outcome.FAILED

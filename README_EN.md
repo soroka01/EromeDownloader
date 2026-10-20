@@ -252,7 +252,8 @@ EromeDownloader/
 │   ├── downloader.py      # file downloading
 │   ├── models.py          # data models
 │   ├── net.py             # networking
-│   ├── storage.py         # queues, statuses, manifest
+│   ├── storage.py         # queues and status files
+│   ├── manifest.py        # the manifest.json report
 │   ├── ui.py              # terminal UI: colours, status line, prompts
 │   ├── urls.py            # URL parsing and sorting
 │   ├── workflow.py        # mode 1-4 workflows

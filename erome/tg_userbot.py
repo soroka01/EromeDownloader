@@ -142,7 +142,7 @@ class Userbot(Transport):
         *,
         on_delivered: Callable[[list[SendItem]], None],
         on_bytes: Callable[[int], None] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Refusal]:
         """Post the files to the target topic, in order.
 
         Returns {file key: Refusal} for the files Telegram refused; `Refusal.lasting` tells whether the file itself is
@@ -152,7 +152,7 @@ class Userbot(Transport):
         means that anything was posted twice, because every message keeps its random_id. Uploaded file handles
         stay on the items, so a repeated call does not send the bytes again.
         """
-        refused: dict[str, str] = {}
+        refused: dict[str, Refusal] = {}
         sendable: list[SendItem] = []
         for item in items:
             if item.size <= 0:
@@ -177,9 +177,9 @@ class Userbot(Transport):
 
     async def _upload_items(
         self, client: TelegramClient, items: list[SendItem], on_bytes: Callable[[int], None] | None
-    ) -> dict[str, str]:
+    ) -> dict[str, Refusal]:
         """Upload what is not on Telegram's side yet. Returns {key: reason} for files Telegram refused to take."""
-        rejected: dict[str, str] = {}
+        rejected: dict[str, Refusal] = {}
         semaphore = asyncio.Semaphore(SMALL_UPLOAD_CONCURRENCY)
 
         async def upload(item: SendItem) -> None:
@@ -264,13 +264,13 @@ class Userbot(Transport):
 
     async def _send_unit(
         self, unit: list[SendItem], caption: str, on_delivered: Callable[[list[SendItem]], None]
-    ) -> tuple[dict[str, str], bool]:
+    ) -> tuple[dict[str, Refusal], bool]:
         """Post one album or one single file. Returns ({key: reason} of refused files, whether anything arrived).
 
         Every message that Telegram accepted is reported at once - not after the whole unit - so a failure later in
         the unit never makes the caller send the earlier files again.
         """
-        refused: dict[str, str] = {}
+        refused: dict[str, Refusal] = {}
         if len(unit) > 1:
             try:
                 await self._send_album(unit, caption)

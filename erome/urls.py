@@ -13,7 +13,7 @@ from erome.config import (
     MIN_CONNECTIONS_PER_PARALLEL_ALBUM,
     SORT_ALBUMS_BY_SIZE,
 )
-from erome.models import AlbumData, FileJob
+from erome.models import AlbumData, FileJob, LinkKind
 
 
 def clean_queue_links(links: Iterable[str]) -> list[str]:
@@ -144,16 +144,16 @@ def normalize_download_url(url: str) -> str:
     return url
 
 
-def link_kind(url: str) -> str:
+def link_kind(url: str) -> LinkKind:
     if is_erome_account_url(url):
-        return "account"
+        return LinkKind.ACCOUNT
     if is_erome_album_url(url):
-        return "album"
-    return "direct"
+        return LinkKind.ALBUM
+    return LinkKind.DIRECT
 
 
 def download_sort_key(url: str) -> tuple[int, str, str]:
-    kind_order = {"direct": 0, "album": 1, "account": 2}
+    kind_order = {LinkKind.DIRECT: 0, LinkKind.ALBUM: 1, LinkKind.ACCOUNT: 2}
     parsed = urlparse(url)
     return (
         kind_order.get(link_kind(url), 99),
@@ -209,12 +209,7 @@ def prepare_account_links(links: Iterable[str]) -> list[str]:
 
 
 def prepare_download_links(links: Iterable[str], sort_links: bool) -> list[str]:
-    prepared = [
-        normalize_download_url(link)
-        for link in links
-        if link.strip() and not link.strip().startswith("#")
-    ]
-    prepared = dedupe_preserve_order(prepared)
+    prepared = dedupe_preserve_order(normalize_download_url(link) for link in clean_queue_links(links))
     return sort_download_links(prepared) if sort_links else prepared
 
 

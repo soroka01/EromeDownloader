@@ -16,10 +16,11 @@ import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 from erome.config import LINKS_DIR
 from erome.console import log_warn
+from erome.models import LinkKind
 from erome.storage import ensure_runtime_dirs, write_text_atomic
 from erome.urls import normalize_download_url
 
@@ -33,15 +34,6 @@ DONE = "done"
 PARTIAL = "partial"
 FAILED = "failed"
 CANCELLED = "cancelled"
-
-
-def canonical_url(url: str) -> str:
-    """An album/profile link in the one spelling used as a key: the site answers on erome.com and www.erome.com."""
-    url = normalize_download_url(url)
-    parsed = urlparse(url)
-    if (parsed.hostname or "").lower() in ("erome.com", "www.erome.com") and parsed.path:
-        return urlunparse(("https", "www.erome.com", parsed.path.rstrip("/") or "/", "", "", ""))
-    return url
 
 
 def file_key(url: str) -> str:
@@ -58,7 +50,7 @@ def random_id_for(job_id: str, key: str) -> int:
 @dataclass
 class Job:
     id: str
-    kind: str  # "album" | "account"
+    kind: LinkKind
     url: str
     status: str = QUEUED
     added: float = 0.0
@@ -71,6 +63,9 @@ class Job:
     note: str = ""
     tries: int = 0  # times the page could not be read for a temporary reason (the job waited and started again)
     not_before: float = 0.0  # epoch seconds; a job that waits for another try is not started earlier
+
+    def __post_init__(self) -> None:
+        self.kind = LinkKind(self.kind)  # the queue file stores the plain string
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Job":
@@ -132,7 +127,7 @@ class TelegramState:
             try:
                 jobs.append(Job.from_dict(item))
             except (TypeError, ValueError):
-                continue
+                log_warn("В очереди Telegram есть запись, которую не удалось прочитать; она пропущена")
         return jobs
 
     def save(self) -> None:
@@ -147,7 +142,7 @@ class TelegramState:
     # ----- queue ------------------------------------------------------------------------------
 
     def find_open(self, url: str) -> Job | None:
-        url = canonical_url(url)
+        url = normalize_download_url(url)
         return next((job for job in self.queue if job.url == url), None)
 
     def next_queued(self) -> Job | None:
@@ -160,12 +155,12 @@ class TelegramState:
     def running(self) -> Job | None:
         return next((job for job in self.queue if job.status == RUNNING), None)
 
-    def _new_job(self, kind: str, url: str, parent: str = "") -> Job:
+    def _new_job(self, kind: LinkKind, url: str, parent: str = "") -> Job:
         return Job(id=uuid.uuid4().hex[:10], kind=kind, url=url, added=time.time(), parent=parent)
 
-    def add(self, kind: str, url: str) -> Job | None:
+    def add(self, kind: LinkKind, url: str) -> Job | None:
         """Append a job; None when the same link is already queued or running."""
-        url = canonical_url(url)
+        url = normalize_download_url(url)
         if not url or self.find_open(url):
             return None
         job = self._new_job(kind, url)
@@ -194,6 +189,11 @@ class TelegramState:
     def finish(self, job: Job, status: str, note: str = "") -> None:
         if any(done.id == job.id for done in self.history):
             return  # already finished (for example a profile job replaced by its albums)
+        self._archive(job, status, note)
+        self.save()
+
+    def _archive(self, job: Job, status: str, note: str) -> None:
+        """Move a job from the queue to the history (the caller saves)."""
         job.status = status
         job.note = note
         job.finished = time.time()
@@ -201,7 +201,6 @@ class TelegramState:
             self.queue.remove(job)
         self.history.append(job)
         del self.history[:-HISTORY_LIMIT]
-        self.save()
 
     def expand_account(self, job: Job, album_urls: Iterable[str], note: str) -> int:
         """Replace a finished profile scan by its albums (one atomic write, albums go next in the queue)."""
@@ -209,18 +208,12 @@ class TelegramState:
         added: list[Job] = []
         known = {item.url for item in self.queue}
         for url in album_urls:
-            url = canonical_url(url)
+            url = normalize_download_url(url)
             if url and url not in known:
                 known.add(url)
-                added.append(self._new_job("album", url, parent=job.id))
+                added.append(self._new_job(LinkKind.ALBUM, url, parent=job.id))
         self.queue[index:index] = added
-        job.status = DONE
-        job.note = note
-        job.finished = time.time()
-        if job in self.queue:
-            self.queue.remove(job)
-        self.history.append(job)
-        del self.history[:-HISTORY_LIMIT]
+        self._archive(job, DONE, note)
         self.save()
         return len(added)
 
@@ -267,7 +260,7 @@ class TelegramState:
             self._refused.pop(album, None)
         elif record.get("done"):
             self._done.add(album)
-        elif isinstance(record.get("x"), dict):  # files Telegram refused for good (new in this version of the ledger)
+        elif isinstance(record.get("x"), dict):  # files Telegram refused for good
             limit = int(record.get("lim") or 0)
             entries = self._refused.setdefault(album, {})
             for key, reason in record["x"].items():
@@ -284,13 +277,13 @@ class TelegramState:
             os.fsync(stream.fileno())
 
     def sent_keys(self, album_url: str) -> set[str]:
-        return set(self._sent.get(canonical_url(album_url), ()))
+        return set(self._sent.get(normalize_download_url(album_url), ()))
 
     def is_album_done(self, album_url: str) -> bool:
-        return canonical_url(album_url) in self._done
+        return normalize_download_url(album_url) in self._done
 
     def record_batch(self, album_url: str, keys: Iterable[str], nbytes: int) -> None:
-        album_url = canonical_url(album_url)
+        album_url = normalize_download_url(album_url)
         keys = list(keys)
         if not keys:
             return
@@ -302,7 +295,7 @@ class TelegramState:
 
         A refusal recorded under a smaller limit is not valid any more (the account may have got Premium since).
         """
-        album_url = canonical_url(album_url)
+        album_url = normalize_download_url(album_url)
         sent = self._sent.get(album_url, ())
         return {
             key: reason
@@ -311,7 +304,7 @@ class TelegramState:
         }
 
     def record_refused(self, album_url: str, reasons: dict[str, str], limit: int) -> None:
-        album_url = canonical_url(album_url)
+        album_url = normalize_download_url(album_url)
         reasons = {key: reason[:120] for key, reason in reasons.items()}
         if not reasons:
             return
@@ -321,13 +314,13 @@ class TelegramState:
             entries[key] = (int(limit), reason)
 
     def mark_album_done(self, album_url: str, title: str = "") -> None:
-        album_url = canonical_url(album_url)
+        album_url = normalize_download_url(album_url)
         if album_url not in self._done:
             self._append({"a": album_url, "done": 1, "n": title[:120]})
             self._done.add(album_url)
 
     def reset_album(self, album_url: str) -> None:
-        album_url = canonical_url(album_url)
+        album_url = normalize_download_url(album_url)
         if album_url in self._sent or album_url in self._done or album_url in self._refused:
             self._append({"a": album_url, "reset": 1})
             self._sent.pop(album_url, None)
