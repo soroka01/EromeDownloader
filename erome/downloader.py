@@ -55,7 +55,7 @@ def _chain_bytes(
     return both
 
 
-async def _download(
+async def download_urls(
     album: str,
     urls: Iterable[str],
     max_connections: int,
@@ -224,7 +224,7 @@ async def _download_file_once(
 
         if response.status == 416:
             total_size = parse_content_range_total(response.headers.get("Content-Range"))
-            if resume_from and total_size and resume_from >= total_size:
+            if resume_from and total_size and resume_from == total_size:
                 part_path.replace(job.path)
                 size = job.path.stat().st_size if job.path.exists() else total_size
                 if show_messages:

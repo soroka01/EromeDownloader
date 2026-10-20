@@ -26,24 +26,26 @@ from erome.config import (
 from erome.console import (
     LiveProgress,
     friendly_error,
-    log,
     log_hint,
     log_retry_unless_quiet,
     log_warn,
     short_url,
 )
-from erome.ui import human_size
 from erome.models import AlbumData, AlbumFetchError, DownloadError, DownloadResultCallback
+from erome.ui import human_size
 from erome.urls import (
-    _clean_album_title,
     account_name_from_url,
     account_page_url,
     dedupe_preserve_order,
     is_erome_album_url,
     normalize_account_url,
     normalize_album_url,
+    safe_name,
     sort_album_data,
 )
+
+
+PAGE_GONE_STATUSES = frozenset({404, 410})  # a later page of a profile that answers 403 is throttled, not gone
 
 
 def make_session(
@@ -459,10 +461,13 @@ async def collect_account_album_urls(account_url: str, show_progress: bool = Tru
             for page_url in page_urls
         ]
         albums_by_page: dict[str, list[str]] = {}
+        unread: list[AlbumFetchError] = []
 
-        def on_page(item: tuple[str, list[str]] | Exception) -> None:
-            if isinstance(item, Exception):
+        def on_page(item: tuple[str, list[str]] | AlbumFetchError) -> None:
+            if isinstance(item, AlbumFetchError):
                 log_warn(f"account page: {friendly_error(item)}")
+                if item.status not in PAGE_GONE_STATUSES:  # a page that is gone has no albums; a failing one is unread
+                    unread.append(item)
             else:
                 albums_by_page[item[0]] = item[1]
 
@@ -474,13 +479,18 @@ async def collect_account_album_urls(account_url: str, show_progress: bool = Tru
         ) as pages_progress:
             await drain_tasks(tasks, on_page, pages_progress)
 
+        if unread:  # a profile read with pages missing must not pass for a complete one
+            raise AlbumFetchError(
+                f"прочитано страниц профиля: {len(page_urls) + 1 - len(unread)} из {len(page_urls) + 1} "
+                f"({friendly_error(unread[0])})"
+            )
         for page_url in page_urls:  # pages finish in any order, the result keeps the site's order
             album_urls.extend(albums_by_page.get(page_url, []))
 
     return dedupe_preserve_order(album_urls)
 
 
-async def _collect_album_data(
+async def collect_album_data(
     url: str,
     skip_videos: bool,
     skip_images: bool,
@@ -502,9 +512,9 @@ def parse_album_html_data(
 
     meta_title = soup.find("meta", property="og:title")
     if meta_title and meta_title.has_attr("content"):
-        album_title = _clean_album_title(meta_title["content"])
+        album_title = safe_name(meta_title["content"])
     else:
-        album_title = _clean_album_title("temp")
+        album_title = safe_name("temp")
 
     video_urls: list[str] = []
     if not skip_videos:

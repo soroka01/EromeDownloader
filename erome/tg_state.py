@@ -1,8 +1,10 @@
 """Persistent state of the Telegram mode: the job queue and the ledger of what was already delivered.
 
 The queue (`links/tg_queue.json`) is rewritten atomically on every structural change, so a link the bot
-acknowledged survives a crash. The ledger (`links/tg_sent.jsonl`) is append-only: one line per delivered batch,
-which is what keeps a restart or a repeated link from sending anything twice.
+acknowledged survives a crash. The ledger (`links/tg_sent.jsonl`) is append-only: one line per delivered batch
+(`k`), per album that is complete (`done`), per set of files Telegram refused for good (`x`) and per `/resend`
+(`reset`). It is what keeps a restart or a repeated link from sending anything twice or downloading a file that
+Telegram will refuse again.
 """
 from __future__ import annotations
 
@@ -31,7 +33,6 @@ DONE = "done"
 PARTIAL = "partial"
 FAILED = "failed"
 CANCELLED = "cancelled"
-FINISHED = frozenset({DONE, PARTIAL, FAILED, CANCELLED})
 
 
 def canonical_url(url: str) -> str:
@@ -68,15 +69,13 @@ class Job:
     files_sent: int = 0
     bytes_sent: int = 0
     note: str = ""
+    tries: int = 0  # times the page could not be read for a temporary reason (the job waited and started again)
+    not_before: float = 0.0  # epoch seconds; a job that waits for another try is not started earlier
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Job":
         known = {item.name for item in fields(cls)}
         return cls(**{key: value for key, value in data.items() if key in known})
-
-    @property
-    def is_open(self) -> bool:
-        return self.status in (QUEUED, RUNNING)
 
 
 class TelegramState:
@@ -88,6 +87,7 @@ class TelegramState:
         self.panels: dict[str, int] = {}
         self._sent: dict[str, set[str]] = {}
         self._done: set[str] = set()
+        self._refused: dict[str, dict[str, tuple[int, str]]] = {}  # album -> {file key: (upload limit then, reason)}
 
     # ----- persistence ------------------------------------------------------------------------
 
@@ -151,7 +151,8 @@ class TelegramState:
         return next((job for job in self.queue if job.url == url), None)
 
     def next_queued(self) -> Job | None:
-        return next((job for job in self.queue if job.status == QUEUED), None)
+        now = time.time()
+        return next((job for job in self.queue if job.status == QUEUED and job.not_before <= now), None)
 
     def queued(self) -> list[Job]:
         return [job for job in self.queue if job.status == QUEUED]
@@ -179,6 +180,15 @@ class TelegramState:
     def requeue(self, job: Job) -> None:
         if job in self.queue:
             job.status = QUEUED
+            self.save()
+
+    def defer(self, job: Job, seconds: float, note: str) -> None:
+        """A temporary problem (the site does not answer): the job goes back and is not started for `seconds`."""
+        if job in self.queue:
+            job.status = QUEUED
+            job.tries += 1
+            job.not_before = time.time() + seconds
+            job.note = note
             self.save()
 
     def finish(self, job: Job, status: str, note: str = "") -> None:
@@ -238,6 +248,7 @@ class TelegramState:
     def _load_ledger(self) -> None:
         self._sent.clear()
         self._done.clear()
+        self._refused.clear()
         if not self.ledger_path.exists():
             return
         with self.ledger_path.open("r", encoding="utf-8") as stream:
@@ -245,15 +256,24 @@ class TelegramState:
                 try:
                     record = json.loads(line)
                     album = str(record["a"])
-                except (ValueError, KeyError, TypeError):
+                    self._replay(album, record)
+                except (ValueError, KeyError, TypeError, AttributeError):
                     continue  # a line cut short by a crash
-                if record.get("reset"):
-                    self._sent.pop(album, None)
-                    self._done.discard(album)
-                elif record.get("done"):
-                    self._done.add(album)
-                elif isinstance(record.get("k"), list):
-                    self._sent.setdefault(album, set()).update(str(key) for key in record["k"])
+
+    def _replay(self, album: str, record: dict[str, Any]) -> None:
+        if record.get("reset"):
+            self._sent.pop(album, None)
+            self._done.discard(album)
+            self._refused.pop(album, None)
+        elif record.get("done"):
+            self._done.add(album)
+        elif isinstance(record.get("x"), dict):  # files Telegram refused for good (new in this version of the ledger)
+            limit = int(record.get("lim") or 0)
+            entries = self._refused.setdefault(album, {})
+            for key, reason in record["x"].items():
+                entries[str(key)] = (limit, str(reason))
+        elif isinstance(record.get("k"), list):
+            self._sent.setdefault(album, set()).update(str(key) for key in record["k"])
 
     def _append(self, record: dict[str, Any]) -> None:
         record["t"] = int(time.time())
@@ -277,6 +297,29 @@ class TelegramState:
         self._append({"a": album_url, "k": keys, "b": int(nbytes)})
         self._sent.setdefault(album_url, set()).update(keys)
 
+    def refused(self, album_url: str, limit: int) -> dict[str, str]:
+        """{file key: reason} of the files Telegram refused for good, valid for an upload limit of `limit` bytes.
+
+        A refusal recorded under a smaller limit is not valid any more (the account may have got Premium since).
+        """
+        album_url = canonical_url(album_url)
+        sent = self._sent.get(album_url, ())
+        return {
+            key: reason
+            for key, (then, reason) in self._refused.get(album_url, {}).items()
+            if (then == 0 or then >= limit) and key not in sent
+        }
+
+    def record_refused(self, album_url: str, reasons: dict[str, str], limit: int) -> None:
+        album_url = canonical_url(album_url)
+        reasons = {key: reason[:120] for key, reason in reasons.items()}
+        if not reasons:
+            return
+        self._append({"a": album_url, "x": reasons, "lim": int(limit)})
+        entries = self._refused.setdefault(album_url, {})
+        for key, reason in reasons.items():
+            entries[key] = (int(limit), reason)
+
     def mark_album_done(self, album_url: str, title: str = "") -> None:
         album_url = canonical_url(album_url)
         if album_url not in self._done:
@@ -285,7 +328,8 @@ class TelegramState:
 
     def reset_album(self, album_url: str) -> None:
         album_url = canonical_url(album_url)
-        if album_url in self._sent or album_url in self._done:
+        if album_url in self._sent or album_url in self._done or album_url in self._refused:
             self._append({"a": album_url, "reset": 1})
             self._sent.pop(album_url, None)
             self._done.discard(album_url)
+            self._refused.pop(album_url, None)

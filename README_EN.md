@@ -46,16 +46,20 @@ Modes:
 | `4` | `links/accs.txt` | Only finds new albums and appends them to `pending.txt` |
 | `5` | Telegram bot chat | Takes links, downloads and posts them to a group, see [the section below](#-telegram-bot-mode-5) |
 
-- Mode `1` writes to the manifest but does not maintain `ready.txt`, `failed.txt` and `banned.txt` as a batch queue.
+- For a single album or file, mode `1` writes only the manifest. Given an account, it behaves like a queue: the statuses of the account's albums go to `ready.txt`, `failed.txt` and `banned.txt`, and the account itself goes to the manifest.
 - Mode `3` always collects both images and videos: `skip_images` and `skip_videos` are not applied to it.
 - Mode `4` treats URLs from `ready`, `banned`, `failed` and `pending` as known, so a failed URL is not re-queued automatically.
+- Album links are understood in any form (`http://`, without `www`, without `https://`, with a trailing `?…`) and stored in one: `https://www.erome.com/a/<id>`.
+- If not all pages of an account could be read (the site answered with an error or temporarily shut the door), the account counts as failed - a partial list is never passed off as a complete one. In modes `3` and `4` it is checked again on the next run; in mode `2` it moves from `pending.txt` to `failed_accs.txt` (put it back into `pending.txt` by hand).
+- A failure of one link or album (for example an invalid folder name) does not stop the others: it is marked `failed` and reported in the console.
 
 ### Console controls
 
 - Main menu: `1`-`5` are the modes from the table above, `0` (or `q`, `exit`) quits. Empty input selects `1`. The menu is shown again after every action.
 - `Ctrl+C` interrupts the current action and returns to the menu; `.part` files and queues are kept, so unfinished work continues on the next run.
 - While running, a single progress line is updated at the bottom: links, albums and files processed, transferred size, speed and time left.
-- Hot keys (interactive console only, also work on a Russian keyboard layout): `S` - status, `P` - pause, `Q` - stop after the current item. Pause and stop take effect between items: queue links and albums, accounts; an album or file already in progress runs to completion. While downloading a single album or file (mode `1`) only `S` works. Unprocessed items stay in the queue.
+- Hot keys (interactive console only, also work on a Russian keyboard layout): `S` - status, `P` - pause, `Q` - stop after the current item. Pause and stop take effect between items: queue links and albums, accounts; an album or file already in progress runs to completion. While downloading a single album or file (mode `1`) only `S` works; for an account in mode `1`, pause and stop take effect between its albums. Unprocessed items stay in the queue.
+- The `links/*.txt` files may be edited by hand while the menu is open: they are re-read before every action.
 
 ## 🚀 Quick start
 
@@ -124,28 +128,28 @@ The `downloads/` and `links/` directories are created automatically.
 }
 ```
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `max_connections` | `6` | Overall target limit of download connections |
-| `min_connections_per_parallel_album` | `3` | Minimum connections per parallel album |
-| `max_parallel_albums` | `3` | Maximum albums processed at once |
-| `auto_sort_links` | `true` | Sort the queue before processing |
-| `album_prefetch_connections` | `6` | Limit of parallel album page reads |
-| `account_page_connections` | `3` | Limit of account page requests |
-| `account_max_pages` | `500` | Page limit per account |
-| `sort_albums_by_size` | `true` | Estimate size and sort albums |
-| `album_size_probe_connections` | `3` | Parallel size probes |
-| `album_size_probe_timeout` | `20` | Size probe timeout, seconds |
-| `chunk_size_mb` | `1` | Size of a written chunk, MB |
-| `max_attempts` | `4` | File download attempts |
-| `page_attempts` | `3` | HTML page read attempts |
-| `connect_timeout` | `30` | Connection timeout, seconds |
-| `idle_timeout` | `180` | Allowed time without new data, seconds |
-| `skip_videos` | `false` | Skip videos in modes that honor the filter |
-| `skip_images` | `false` | Skip images in modes that honor the filter |
-| `manifest_path` | `links/manifest.json` | JSON manifest path: project-relative or absolute |
+| Variable | Default | Allowed | Description |
+| --- | --- | --- | --- |
+| `max_connections` | `6` | 1-256 | Overall target limit of download connections |
+| `min_connections_per_parallel_album` | `3` | 1-256 | Minimum connections per parallel album |
+| `max_parallel_albums` | `3` | 1-256 | Maximum albums processed at once |
+| `auto_sort_links` | `true` | true / false | Sort the queue before processing |
+| `album_prefetch_connections` | `6` | 1-256 | Limit of parallel album page reads |
+| `account_page_connections` | `3` | 1-256 | Limit of account page requests |
+| `account_max_pages` | `500` | 1-100000 | Page limit per account |
+| `sort_albums_by_size` | `true` | true / false | Estimate size and sort albums |
+| `album_size_probe_connections` | `3` | 1-256 | Parallel size probes |
+| `album_size_probe_timeout` | `20` | 1-86400 | Size probe timeout, seconds |
+| `chunk_size_mb` | `1` | 1-1024 | Size of a written chunk, MB |
+| `max_attempts` | `4` | 1-100 | File download attempts |
+| `page_attempts` | `3` | 1-100 | HTML page read attempts |
+| `connect_timeout` | `30` | 1-86400 | Connection timeout, seconds |
+| `idle_timeout` | `180` | 1-86400 | Allowed time without new data, seconds |
+| `skip_videos` | `false` | true / false | Skip videos in modes that honor the filter |
+| `skip_images` | `false` | true / false | Skip images in modes that honor the filter |
+| `manifest_path` | `links/manifest.json` | path | JSON manifest path: project-relative or absolute |
 
-Value types and ranges are not validated — edit with care.
+Values are checked at startup and every correction is reported as a warning in the console: a number out of range is replaced by the nearest allowed one (`300` → `256`), and something that is not a number, or not `true`/`false`, by its default. An unknown key (a typo, say) is ignored, also with a warning.
 
 ### Queues and outputs
 
@@ -163,10 +167,14 @@ Value types and ranges are not validated — edit with care.
 
 One URL per line; blank lines and lines starting with `#` are ignored by batch modes. After a final failure, mode `2` moves the URL from `pending.txt` to `failed.txt`; to retry, add it back to `pending.txt` manually.
 
+`manifest.json` is a report; no decision is made from it. It is written at most once every 5 seconds and at the end of every action; if the file is busy or the disk is unavailable the program warns once and keeps downloading.
+
+Folder and file names are made safe for Windows: forbidden and control characters become `_`, device names (`CON`, `NUL`, `COM1`…) get a leading `_`, and names that are too long are shortened (the file extension is kept).
+
 ### Importing bookmarks
 
 1. Export browser bookmarks to `bookmarks*.html` and put the file next to `main.py`.
-2. Run `python extract_links.py`, choose the file and confirm.
+2. Run `python extract_links.py`, choose the file and confirm. Links are brought to the single form `https://www.erome.com/a/<id>` and duplicates are removed.
 
 > [!WARNING]
 > The importer **replaces the contents** of `links/pending.txt` with the found links instead of merging them. Back up the old file or merge lists manually.
@@ -209,10 +217,12 @@ flowchart LR
 ### Usage
 
 - Send album links (`erome.com/a/…`) and profile links (`erome.com/name`): one per message or several in a single message. The bot deletes your message and shows its state in a single panel message that updates itself: the current album (downloaded and sent counts, speed, time left), the queue and recently finished items (Moscow time).
-- Panel buttons: pause / resume, cancel the current album, clear the queue (press twice).
-- Commands: `/start` — instructions, `/queue` — bring the panel back to the bottom of the chat, `/resend link` — post an album again.
+- Panel buttons: pause / resume, cancel the current album, clear the queue (press twice). Pause does not interrupt the batch of files being sent right now: it runs to the end, then nothing new starts.
+- Commands: `/start` — instructions, `/queue` — bring the panel back to the bottom of the chat, `/resend link` — post an album again (an album that is queued or being sent right now must not be touched: the bot asks you to wait until it is done).
 - A profile expands into the albums that were not sent to the group yet, oldest first; albums that were fully sent are skipped. To pick up new files in an old album, send the album link itself.
+- If the site did not answer (an album or profile page did not open or was read only in part), the job is not lost: it is put off and tried again after 1, 3 and 10 minutes (4 tries in all) while the other jobs carry on. The panel shows when the retry is due.
 - In the console: `S` — status, `P` — pause, `Q` — stop after the current batch of files, `Ctrl+C` — interrupt at once. The queue is stored on disk and continues on the next run.
+- If the bot stops receiving messages (token revoked, no network, the same bot running somewhere else) the console says so; during a long outage the message repeats at most once an hour.
 
 ### What is sent and how
 
@@ -220,7 +230,9 @@ flowchart LR
 - While one batch (up to 10 files) is being posted, the next one is downloaded. Files live in `downloads/_telegram/`, not in the main `downloads/` archive.
 - The ledger `links/tg_sent.jsonl` remembers every batch Telegram accepted, and every message has a fixed `random_id`: a repeated link, a lost connection or a restart at any moment never creates duplicates. Only what is missing is sent again.
 - Files that failed to download are tried once more at the end of the album; if some never arrive the album is marked as partly sent, and sending the link again fetches the rest.
+- Files that Telegram rejected on their own account (over the size limit, refused as unusable media) are written to the ledger: a repeated link or a profile expansion does not download them again, and the album shows "everything sent except N files" with the reason. Temporary trouble (a lost connection, a group that refuses messages) is not written down and is tried again next time. `/resend` clears this mark too; if the account's limit grows (Premium), the mark stops applying by itself.
 - Telegram's file limit is 2 GB, 4 GB for a Premium account.
+- If the group or topic does not accept messages (topic closed, no rights) the queue is kept and checked again less and less often — after 1, 2, 4 … up to 15 minutes — with the reason in the panel and console.
 - The mode can run in one window only.
 
 ## 🗂️ Project structure
@@ -247,9 +259,11 @@ EromeDownloader/
 │   ├── tg_settings.py     # mode 5: telegram.json, token, credentials
 │   ├── tg_state.py        # mode 5: queue and ledger of what was sent
 │   ├── tg_media.py        # mode 5: file kind, video metadata, thumbnails
-│   ├── tg_userbot.py      # mode 5: userbot (Telethon), QR sign-in, sending
+│   ├── tg_transport.py    # mode 5: Telethon connection, file uploads, QR sign-in
+│   ├── tg_userbot.py      # mode 5: userbot - albums and messages, what counts as delivered
 │   ├── tg_pipeline.py     # mode 5: download → send
-│   └── tg_bot.py          # mode 5: bot (aiogram), panel, startup
+│   ├── tg_bot.py          # mode 5: bot (aiogram), panel, commands, buttons
+│   └── tg_mode.py         # mode 5: startup - lock, logs, console, all tasks together
 ├── downloads/             # downloaded files; _telegram/ holds mode 5 scratch files (not in Git)
 ├── links/                 # queues, manifest, tg_queue.json and tg_sent.jsonl (not in Git)
 └── data/                  # Telegram session and mode 5 log (not in Git)
@@ -268,7 +282,7 @@ EromeDownloader/
 - Parsing depends on Erome's current HTML markup: `og:title`, `<source>` and `img.img-back`.
 - Resuming works only if the server supports `Range`; otherwise the file is downloaded again.
 - Size may stay unknown if the server does not report it via `HEAD` or a range response.
-- A corrupted manifest is moved to a file with a `.bad` suffix.
+- A corrupted manifest is moved to a file with a `.bad` suffix; if it can be neither read nor moved, it is not overwritten during that run.
 - Mode 5 is bound by Telegram's limits (upload speed, message rate in a group): when throttled the program waits and carries on by itself.
 
 ## 📄 License

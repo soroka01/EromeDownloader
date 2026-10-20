@@ -1,8 +1,8 @@
-"""The Telegram bot of the Telegram mode: takes Erome links from the owner, shows one live panel, runs the worker.
+"""The Telegram bot of the Telegram mode: takes Erome links from the owner and shows one live panel.
 
-One process hosts everything: bot polling (aiogram), the userbot connection (Telethon), the job worker and the
-console status line. Links are queued durably before the owner's message is deleted, so nothing sent to the bot
-can get lost.
+Links are queued durably before the owner's message is deleted, so nothing sent to the bot can get lost. The panel
+is one message per owner that is edited in place; commands and buttons only change the queue and the pause flag.
+Starting and stopping everything is tg_mode.py's business.
 """
 from __future__ import annotations
 
@@ -10,52 +10,36 @@ import asyncio
 import contextlib
 import html
 import logging
-import os
+import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import Callable
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter, TelegramUnauthorizedError
+from aiogram import Bot, F, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 
-from erome.config import BASE_DIR
-from erome.console import RunControl, configure_console, hotkeys, log, log_done, log_error, log_success, log_warn
-from erome.storage import ensure_runtime_dirs
+from erome.console import RunControl, log, log_warn
 from erome.tg_pipeline import Pipeline, Progress
-from erome.tg_settings import (
-    SETTINGS_PATH,
-    SettingsError,
-    TelegramSettings,
-    bot_token_is_set,
-    ensure_settings_file,
-    load_settings,
-    read_raw,
-    save_bot_token,
-    valid_bot_token,
-)
+from erome.tg_settings import TelegramSettings
 from erome.tg_state import CANCELLED, DONE, FAILED, PARTIAL, Job, TelegramState, canonical_url
-from erome.tg_userbot import STATE_READY, Userbot, clean_text, cryptg_available, sign_in_if_needed
-from erome.ui import ConsoleHandler, human_duration, human_size, plural, ui
+from erome.tg_transport import STATE_READY
+from erome.tg_userbot import Userbot
+from erome.ui import human_duration, human_size, plural
 from erome.urls import link_kind
 
 LOG = logging.getLogger("erome.tg")
 
-DATA_DIR = BASE_DIR / "data"
 MSK = timezone(timedelta(hours=3), "МСК")
 PANEL_EDIT_INTERVAL = 3.5  # seconds between edits of the live panel (Telegram allows about one per second)
+PANEL_USER_EDIT_GAP = 1.2  # a reply to the owner is drawn at once unless the panel was edited this recently
 NOTICE_SECONDS = 25
 CONFIRM_SECONDS = 6
 QUEUE_LINES = 5
@@ -135,21 +119,8 @@ def view_signature(text: str, markup: InlineKeyboardMarkup) -> tuple:
     return text, tuple(button.text for row in markup.inline_keyboard for button in row)
 
 
+
 # ----- the application --------------------------------------------------------------------------------
-
-
-class TelegramControl(RunControl):
-    """Console hot keys of the Telegram mode: S prints what is going on instead of the downloader's bar."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.status: Callable[[], str] | None = None
-
-    def handle(self, key: str) -> None:
-        if key == "s" and self.status is not None:
-            ui.line(f"  {self.status()}", "dim")
-            return
-        super().handle(key)
 
 
 class BotApp:
@@ -216,13 +187,13 @@ class BotApp:
             lines += ["", self.notice]
         warnings = []
         if self.userbot.state != STATE_READY:
-            warnings.append(f"⚠ Telegram: {esc(self.userbot.status_text())}")
+            warnings.append(f"⚠ Telegram: {esc(self.userbot.panel_status())}")
         if self.pipeline.blocked:
             warnings.append(f"⚠ Нет доступа к группе или теме: {esc(self.pipeline.blocked)}")
         if self.pipeline.waiting and self.userbot.state == STATE_READY:
             warnings.append(f"⏳ {esc(self.pipeline.waiting)}")
         if self.paused:
-            warnings.append("⏸ Пауза: новые альбомы не начинаются")
+            warnings.append("⏸ Пауза: текущая пачка файлов дойдёт до конца, дальше ничего не начнётся")
         if warnings:
             lines += [""] + warnings
 
@@ -236,7 +207,9 @@ class BotApp:
         if queued:
             lines += ["", f"<b>В очереди</b> ({len(queued)})"]
             for number, job in enumerate(queued[:QUEUE_LINES], 1):
-                lines.append(f"{number}. {job_label(job)}")
+                wait = job.not_before - time.time()
+                again = f" — сайт не ответил, повтор через ≈{max(1, math.ceil(wait / 60))} мин" if wait > 0 else ""
+                lines.append(f"{number}. {job_label(job)}{again}")
             if len(queued) > QUEUE_LINES:
                 lines.append(f"… и ещё {len(queued) - QUEUE_LINES}")
 
@@ -275,8 +248,10 @@ class BotApp:
     async def show_panel(self, chat_id: int, *, fresh: bool = False) -> None:
         """Draw the panel: edit the existing message, or create it (fresh=True moves it to the bottom of the chat)."""
         async with self._lock(chat_id):
-            text, markup = self.render()
             message_id = self.state.panel_id(chat_id)
+            if not fresh and message_id and time.monotonic() - self._last_edit.get(chat_id, 0.0) < PANEL_USER_EDIT_GAP:
+                return  # edited a moment ago (a burst of links): the refresh loop draws the change right after
+            text, markup = self.render()
             if fresh and message_id:
                 with contextlib.suppress(TelegramAPIError):
                     await self.bot.delete_message(chat_id, message_id)
@@ -345,7 +320,11 @@ class BotApp:
         if self.paused:
             return f"Пауза{tail}"
         if progress is None:
-            return "Жду ссылки в боте · очередь пуста" if not queued else f"Готовлюсь к следующему{tail}"
+            if not queued:
+                return "Жду ссылки в боте · очередь пуста"
+            if self.state.next_queued() is None:
+                return f"Жду повторной попытки: сайт не ответил{tail}"
+            return f"Готовлюсь к следующему{tail}"
         title = progress.title or "…"
         line = f"«{title[:40]}» · {self.activity_line(progress)}"
         if self.pipeline.waiting:
@@ -421,11 +400,19 @@ def build_router(app: BotApp) -> Router:
         if not links:
             app.set_notice("Укажите ссылку на альбом: <code>/resend https://www.erome.com/a/…</code>")
         else:
-            for _, url in links:
+            # An album that is queued or being sent keeps its record: forgetting it mid-run would post its files twice.
+            busy = [item for item in links if app.state.find_open(item[1]) is not None]
+            fresh = [item for item in links if item not in busy]
+            for _, url in fresh:
                 app.state.reset_album(url)
-            albums, _, duplicates = enqueue(links)
-            app.set_notice("🔁 " + describe_added(albums, 0, duplicates))
-            log(f"Повторная отправка: {len(links)}")
+            albums, _, duplicates = enqueue(fresh)
+            notes = []
+            if fresh:
+                notes.append("🔁 " + describe_added(albums, 0, duplicates))
+                log(f"Повторная отправка: {len(fresh)}")
+            if busy:
+                notes.append(f"Уже в очереди или отправляется: {len(busy)} — дождитесь окончания и повторите.")
+            app.set_notice(" ".join(notes))
         await tidy(message)
         await app.show_panel(message.chat.id)
 
@@ -475,259 +462,3 @@ def build_router(app: BotApp) -> Router:
             await app.show_panel(query.message.chat.id)
 
     return router
-
-
-# ----- running -----------------------------------------------------------------------------------------
-
-
-class InstanceLock:
-    """Only one Telegram-mode process may run: two would fight over the bot's updates and the session file."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._handle = None
-
-    def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self.path, "a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            return False
-        self._handle = handle
-        return True
-
-    def release(self) -> None:
-        if self._handle is not None:
-            with contextlib.suppress(OSError):
-                self._handle.close()
-            self._handle = None
-
-
-def configure_logging() -> None:
-    """File log in data/ (Telegram's own warnings included) and short lines in the console."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%d.%m.%y %H:%M:%S")
-    file_handler = RotatingFileHandler(DATA_DIR / "telegram.log", maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    ours = logging.getLogger("erome.tg")
-    ours.setLevel(logging.INFO)
-    ours.propagate = False
-    for handler in list(ours.handlers):
-        ours.removeHandler(handler)
-        handler.close()
-    ours.addHandler(file_handler)
-    ours.addHandler(ConsoleHandler(ui))
-    for name in ("telethon", "aiogram", "aiohttp"):
-        third = logging.getLogger(name)
-        third.setLevel(logging.WARNING)
-        third.propagate = False
-        for handler in list(third.handlers):
-            third.removeHandler(handler)
-        third.addHandler(file_handler)
-
-
-@contextlib.contextmanager
-def console_selection_off():
-    """Windows consoles freeze the whole program while text is selected with the mouse (QuickEdit mode).
-
-    A bot that must keep polling and uploading cannot stand a stray click, so the mode is switched off for
-    the duration of the run and restored afterwards. Anything unusual (not a console, not Windows) is ignored.
-    """
-    restore = None
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.WinDLL("kernel32")  # a private handle: the prototypes below must not leak into ui.py
-            kernel32.GetStdHandle.restype = ctypes.c_void_p
-            kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-            kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-            handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-            mode = ctypes.c_uint32()
-            if handle and kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                extended, quick_edit = 0x0080, 0x0040
-                if kernel32.SetConsoleMode(handle, (mode.value | extended) & ~quick_edit):
-                    restore = (kernel32, handle, mode.value | extended)  # extended flag: the original QuickEdit bit counts
-        except Exception:
-            restore = None
-    try:
-        yield
-    finally:
-        if restore is not None:
-            with contextlib.suppress(Exception):
-                restore[0].SetConsoleMode(restore[1], restore[2])
-
-
-async def announce_connection(userbot: Userbot) -> None:
-    """Tell the console when the Telegram link comes up or goes down (the bot panel shows the same)."""
-    was_ready = False
-    while True:
-        await asyncio.sleep(1.0)
-        try:
-            ready = userbot.ready
-            if ready and not was_ready:
-                premium = " · Premium" if userbot.premium else ""
-                place = f"«{clean_text(userbot.chat_title)}»"
-                if userbot.topic_title:
-                    place += f", тема «{clean_text(userbot.topic_title)}»"
-                log_success(f"Telegram подключён: {userbot.account_name}{premium}; группа {place}")
-            elif was_ready and not ready:
-                log_warn(f"Telegram: {userbot.status_text()}")
-            was_ready = ready
-        except Exception as exc:  # cosmetic: never end the mode because of an announcement
-            LOG.debug("Connection announcement failed: %s", exc)
-
-
-async def console_status_loop(app: BotApp) -> None:
-    while True:
-        try:
-            ui.activity(app.console_line())
-        except Exception as exc:  # cosmetic: never end the mode because of the status line
-            LOG.debug("Console status failed: %s", exc)
-        await asyncio.sleep(1.0)
-
-
-async def serve(settings: TelegramSettings, control: TelegramControl) -> None:
-    ensure_runtime_dirs()
-    state = TelegramState()
-    state.load()
-    userbot = Userbot(settings)
-    pipeline = Pipeline(state, userbot, settings)
-    bot = Bot(
-        settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True),
-    )
-    app = BotApp(bot, state, pipeline, userbot, settings, control)
-    control.status = app.status_text
-    dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(app))
-
-    try:
-        me = await bot.get_me()
-    except TelegramUnauthorizedError:
-        await bot.session.close()
-        raise SettingsError("Telegram не принял токен бота: проверьте bot_token в telegram.json") from None
-    except BaseException:
-        await bot.session.close()
-        raise
-    try:
-        await bot.set_my_commands(
-            [
-                BotCommand(command="start", description="как пользоваться"),
-                BotCommand(command="queue", description="показать панель очереди"),
-                BotCommand(command="resend", description="отправить альбом заново"),
-            ]
-        )
-    except TelegramAPIError as exc:
-        LOG.warning("Could not register the bot commands: %s", exc)
-    queued = len(state.queued())
-    log_success(f"Бот @{me.username} запущен. Владельцы: {', '.join(str(i) for i in sorted(settings.owner_ids))}")
-    if queued:
-        log(f"Продолжаю очередь: {count_text(queued, 'ссылка', 'ссылки', 'ссылок')}")
-    if not cryptg_available():
-        log_warn("Не установлен cryptg: отправка больших файлов будет медленной и может подвешивать программу")
-
-    await userbot.start()
-    tasks = {
-        "pipeline": asyncio.create_task(pipeline.run(), name="pipeline"),
-        "panels": asyncio.create_task(app.refresh_loop(), name="panels"),
-        "console": asyncio.create_task(console_status_loop(app), name="console"),
-        "link": asyncio.create_task(announce_connection(userbot), name="link"),
-        "polling": asyncio.create_task(
-            dispatcher.start_polling(
-                bot,
-                handle_signals=False,
-                close_bot_session=False,
-                allowed_updates=["message", "callback_query"],
-            ),
-            name="polling",
-        ),
-    }
-    try:
-        done, _ = await asyncio.wait(tasks.values(), return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task.result()  # a crashed part ends the mode with its error; a finished worker means "stop"
-    finally:
-        ui.idle()
-        pipeline.stop()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(tasks["pipeline"], 10)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(dispatcher.stop_polling(), 5)
-        for task in tasks.values():
-            task.cancel()
-        await asyncio.gather(*tasks.values(), return_exceptions=True)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(userbot.stop(), 15)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(bot.session.close(), 5)
-        state.save()
-
-
-async def _run(settings: TelegramSettings) -> None:
-    control = TelegramControl()
-    async with hotkeys(control):
-        await serve(settings, control)
-
-
-def _ask_token() -> bool:
-    ui.line("Нужен токен Telegram-бота: создайте бота у @BotFather (команда /newbot) и вставьте токен сюда.")
-    ui.line("Он сохранится в telegram.json (этот файл не попадает в git).", "dim")
-    token = ui.ask("Токен бота (пусто — отмена)")
-    if not token:
-        return False
-    if not valid_bot_token(token):
-        log_error("Это не похоже на токен бота (ожидается вид 123456789:AAH…). Попробуйте ещё раз.")
-        return False
-    save_bot_token(token)
-    return True
-
-
-def run_telegram_bot() -> None:
-    """Menu entry: prepare settings and the userbot sign-in in the console, then run until stopped."""
-    configure_console()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    lock = InstanceLock(DATA_DIR / "telegram.lock")
-    if not lock.acquire():
-        log_error("Telegram-режим уже запущен в другом окне: закройте его или дождитесь остановки.")
-        return
-    try:
-        configure_logging()
-        if ensure_settings_file():
-            log_warn(f"Создан файл {SETTINGS_PATH.name}: впишите в него chat_id, thread_id, owner_ids и учётные данные.")
-        try:
-            if not bot_token_is_set(read_raw()) and not _ask_token():
-                return
-            settings = load_settings()
-        except SettingsError as exc:
-            log_error(str(exc))
-            log(f"Файл настроек: {SETTINGS_PATH}", "dim")
-            return
-        ui.idle()
-        signed_in, info = sign_in_if_needed(settings, say=ui.line)
-        if not signed_in:
-            log_error(f"Отправка невозможна: {info}")
-            return
-        log_success(f"Аккаунт для отправки: {info}")
-        if settings.account_id is None:
-            log_warn("В telegram.json не указан account_id: проверки аккаунта нет")
-        try:
-            with console_selection_off():
-                asyncio.run(_run(settings))
-        except SettingsError as exc:
-            log_error(str(exc))
-        else:
-            log_done("Telegram-режим остановлен. Очередь сохранена — продолжится при следующем запуске.")
-    finally:
-        ui.idle()
-        lock.release()

@@ -197,14 +197,6 @@ def log_result_summary(label: str, results: list[tuple[str, str]]) -> None:
         log_success(f"{label}: готово {ok_count}/{total}")
 
 
-def print_boxed(text: str, style: str | None = None) -> None:
-    """Banner: the first line is the title, the other lines are details."""
-    first, *rest = text.split("\n")
-    ui.title(first)
-    for line in rest:
-        ui.line(line, style or "dim")
-
-
 # ----- live progress line -------------------------------------------------------------------
 
 

@@ -26,7 +26,6 @@ PROBE_TIMEOUT_SECONDS = 60
 THUMBNAIL_TIMEOUT_SECONDS = 60
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 _VIDEO_RE = re.compile(r"Stream #\d+:\d+.*?Video:.*?,\s*(\d{2,5})x(\d{2,5})")
-_AUDIO_RE = re.compile(r"Stream #\d+:\d+.*?Audio:")
 _ROTATION_RE = re.compile(r"rotation of (-?\d+(?:\.\d+)?) degrees")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
@@ -40,7 +39,6 @@ class VideoInfo:
     duration: float
     width: int
     height: int
-    has_audio: bool
 
 
 @dataclass
@@ -59,6 +57,7 @@ class SendItem:
     file: Any = None
     thumb_file: Any = None
     uploaded_at: float = 0.0
+    thumb_refused: bool = False  # Telegram did not take the thumbnail: the video goes out without one
     stale_resets: int = 0  # times Telegram refused the kept handle (the file is re-uploaded; twice = the file is bad)
 
     def cleanup_paths(self) -> list[Path]:
@@ -109,7 +108,7 @@ def probe_video(path: Path) -> VideoInfo | None:
     if rotation and round(abs(float(rotation.group(1)))) % 180 == 90:
         width, height = height, width  # the player shows the rotated picture
     total = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-    return VideoInfo(total, width, height, bool(_AUDIO_RE.search(text)))
+    return VideoInfo(total, width, height)
 
 
 def make_thumbnail(path: Path, destination: Path, at_seconds: float = 1.0) -> Path | None:

@@ -1,22 +1,26 @@
+import atexit
 import json
+import os
+import time
 from pathlib import Path
 from typing import Callable, Iterable
 
 from erome.config import (
     ACCOUNT_STATUS_FILES,
     BASE_DIR,
-    CONFIG,
     DOWNLOADS_DIR,
     LINKS_DIR,
+    MANIFEST_PATH,
     STATUS_FILES,
 )
 from erome.console import format_bytes, log_warn, now_iso, relative_path
 from erome.models import AlbumData, DownloadResult, DownloadResultCallback, DownloadSummary
 from erome.urls import (
-    _clean_album_title,
+    canonical_status_link,
     clean_queue_links,
     is_erome_account_url,
     normalize_download_url,
+    safe_name,
 )
 
 
@@ -32,7 +36,7 @@ def resolve_base_path(value: str) -> Path:
 
 def manifest_file_path() -> Path:
     ensure_runtime_dirs()
-    path = resolve_base_path(str(CONFIG["manifest_path"]))
+    path = resolve_base_path(MANIFEST_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -51,6 +55,9 @@ def empty_manifest() -> dict:
 _manifest_cache: dict | None = None
 
 
+_manifest_unreadable = False  # the file on disk could not be read or moved aside: never overwrite it
+
+
 def _normalize_manifest(manifest: object) -> dict:
     if not isinstance(manifest, dict):
         return empty_manifest()
@@ -64,30 +71,83 @@ def _normalize_manifest(manifest: object) -> dict:
 
 def load_manifest() -> dict:
     """Возвращает манифест; файл читается с диска только один раз за запуск."""
-    global _manifest_cache
+    global _manifest_cache, _manifest_unreadable
     if _manifest_cache is not None:
         return _manifest_cache
 
-    path = manifest_file_path()
-    if not path.exists():
+    try:
+        path = manifest_file_path()
+        exists = path.exists()
+    except OSError as error:  # for example a manifest_path on a drive that does not exist
+        _manifest_unreadable = True
+        log_warn(f"Путь манифеста недоступен ({error}); отчёт в этом запуске не ведётся")
+        _manifest_cache = empty_manifest()
+        return _manifest_cache
+    if not exists:
         _manifest_cache = empty_manifest()
         return _manifest_cache
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except OSError as error:
+        # The file exists but cannot be read: keep it untouched instead of overwriting the history.
+        _manifest_unreadable = True
+        log_warn(f"Манифест не читается ({error}); отчёт в этом запуске не обновляется")
+        loaded = None
+    except ValueError:
         bad_path = path.with_suffix(path.suffix + ".bad")
-        path.replace(bad_path)
-        log_warn(f"Manifest повреждён, старый файл перенесён в {relative_path(bad_path)}")
+        try:
+            path.replace(bad_path)
+            log_warn(f"Manifest повреждён, старый файл перенесён в {relative_path(bad_path)}")
+        except OSError as error:
+            _manifest_unreadable = True
+            log_warn(f"Manifest повреждён и не переносится ({error}); отчёт в этом запуске не обновляется")
         loaded = None
 
     _manifest_cache = _normalize_manifest(loaded)
     return _manifest_cache
 
 
-def save_manifest(manifest: dict) -> None:
-    path = manifest_file_path()
+MANIFEST_SAVE_INTERVAL = 5.0  # seconds; rewriting a manifest of thousands of albums takes ~0.1 s
+
+
+_manifest_dirty = False
+_manifest_saved_at = 0.0
+_manifest_write_failed = False
+_manifest_exit_hook = False
+
+
+def save_manifest() -> None:
+    """Mark the manifest as changed; the file is written at most once per MANIFEST_SAVE_INTERVAL."""
+    global _manifest_dirty, _manifest_exit_hook
+    _manifest_dirty = True
+    if not _manifest_exit_hook:
+        atexit.register(flush_manifest)
+        _manifest_exit_hook = True
+    if time.monotonic() - _manifest_saved_at >= MANIFEST_SAVE_INTERVAL:
+        flush_manifest()
+
+
+def flush_manifest() -> None:
+    """Write pending manifest changes. The manifest is only a report, so a write error never stops a download."""
+    global _manifest_dirty, _manifest_saved_at, _manifest_write_failed
+    manifest = _manifest_cache
+    if not _manifest_dirty or manifest is None or _manifest_unreadable:
+        return
+    _manifest_saved_at = time.monotonic()
     manifest["updated_at"] = now_iso()
-    write_text_atomic(path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    try:
+        write_text_atomic(
+            manifest_file_path(),
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            durable=True,
+        )
+    except OSError as error:
+        if not _manifest_write_failed:
+            log_warn(f"Не удалось записать манифест ({error}); загрузки продолжаются, повторю позже")
+        _manifest_write_failed = True
+        return
+    _manifest_write_failed = False
+    _manifest_dirty = False
 
 
 def record_file_results(
@@ -110,7 +170,7 @@ def record_file_results(
             "error": result.error,
             "updated_at": now_iso(),
         }
-    save_manifest(manifest)
+    save_manifest()
 
 
 def record_album_manifest(
@@ -135,7 +195,7 @@ def record_album_manifest(
         "videos": album_data.video_count,
         "updated_at": now_iso(),
     }
-    save_manifest(manifest)
+    save_manifest()
 
 
 def record_account_manifest(
@@ -154,7 +214,7 @@ def record_account_manifest(
         "added_to_pending": added_to_pending,
         "updated_at": now_iso(),
     }
-    save_manifest(manifest)
+    save_manifest()
 
 
 def status_file_path(name: str) -> Path:
@@ -172,20 +232,34 @@ def read_clean_lines(path: Path) -> list[str]:
     ]
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+def write_text_atomic(path: Path, text: str, durable: bool = False) -> None:
+    """Write via a temporary file and a rename; `durable` also forces the data to disk before the rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(path.name + ".tmp")
-    temp_path.write_text(text, encoding="utf-8")
+    with temp_path.open("w", encoding="utf-8") as file:
+        file.write(text)
+        if durable:
+            file.flush()
+            os.fsync(file.fileno())
     temp_path.replace(path)
 
 
 _queue_cache: dict[str, dict[str, None]] = {}
 
 
+def reset_queue_cache() -> None:
+    """Forget the in-memory copy of links/*.txt, so a file edited by hand is read again."""
+    _queue_cache.clear()
+
+
+def _entries_from(links: Iterable[str]) -> dict[str, None]:
+    return dict.fromkeys(canonical_status_link(link) for link in clean_queue_links(links))
+
+
 def _queue_entries(name: str) -> dict[str, None]:
     entries = _queue_cache.get(name)
     if entries is None:
-        entries = dict.fromkeys(clean_queue_links(read_clean_lines(status_file_path(name))))
+        entries = _entries_from(read_clean_lines(status_file_path(name)))
         _queue_cache[name] = entries
     return entries
 
@@ -199,7 +273,7 @@ def _flush_queue(name: str) -> None:
 
 
 def write_queue(name: str, links: Iterable[str]) -> None:
-    _queue_cache[name] = dict.fromkeys(clean_queue_links(links))
+    _queue_cache[name] = _entries_from(links)
     _flush_queue(name)
 
 
@@ -294,10 +368,10 @@ def read_accounts() -> list[str]:
     return read_queue("accs")
 
 
-def _get_final_download_path(album_title: str) -> Path:
-    final_path = DOWNLOADS_DIR / _clean_album_title(album_title)
-    final_path.mkdir(parents=True, exist_ok=True)
-    return final_path
+def album_download_dir(album_title: str) -> Path:
+    folder = DOWNLOADS_DIR / safe_name(album_title)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
 
 def result_marker(

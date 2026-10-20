@@ -26,7 +26,7 @@ from erome.console import (
     shorten_text,
     stop_requested,
 )
-from erome.downloader import _download
+from erome.downloader import download_urls
 from erome.models import (
     AlbumData,
     AlbumFetchError,
@@ -35,14 +35,14 @@ from erome.models import (
     FileResultCallback,
 )
 from erome.net import (
-    _collect_album_data,
     album_size_text,
     collect_account_album_urls,
+    collect_album_data,
     collect_album_data_batch,
 )
 from erome.storage import (
     PendingQueue,
-    _get_final_download_path,
+    album_download_dir,
     append_pending_links,
     read_pending,
     read_status_set,
@@ -70,6 +70,14 @@ from erome.urls import (
 )
 
 
+def unexpected_failure(url: str, error: Exception) -> str:
+    """Log an error that no handler expected and return the result status of the failed item."""
+    detail = friendly_error(error)
+    name = type(error).__name__
+    log_error(f"{short_url(url)}: {detail if detail.startswith(name) else f'{name}: {detail}'}")
+    return "failed"
+
+
 async def dump(
     url: str,
     max_connections: int,
@@ -95,7 +103,7 @@ async def dump(
         )
 
     if not is_erome_album_url(url):
-        summary = await _download(
+        summary = await download_urls(
             album=url,
             urls=[url],
             max_connections=1,
@@ -109,7 +117,7 @@ async def dump(
         return summary.overall_status()
 
     try:
-        album_data = await _collect_album_data(
+        album_data = await collect_album_data(
             url=url,
             skip_videos=skip_videos,
             skip_images=skip_images,
@@ -147,7 +155,7 @@ async def download_album_data(
         log_warn(f"{short_url(album_data.url)}: медиа не найдены")
         return "failed"
 
-    download_path = _get_final_download_path(album_data.title)
+    download_path = album_download_dir(album_data.title)
     if show_summary:
         size_info = (
             f", вес {album_size_text(album_data)}"
@@ -160,7 +168,7 @@ async def download_album_data(
             f"{size_info})"
         )
     desc = f"[{album_idx}/{album_total}] Альбом" if album_idx else "Альбом"
-    summary = await _download(
+    summary = await download_urls(
         album=album_data.url,
         urls=album_data.urls,
         max_connections=max_connections,
@@ -300,6 +308,24 @@ async def dump_account(
     return "success"
 
 
+async def dump_account_safely(
+    account_url: str,
+    max_connections: int,
+    skip_videos: bool,
+    skip_images: bool,
+) -> str:
+    """`dump_account` for loops over several accounts: an unexpected error fails this account only."""
+    try:
+        return await dump_account(
+            account_url=account_url,
+            max_connections=max_connections,
+            skip_videos=skip_videos,
+            skip_images=skip_images,
+        )
+    except Exception as error:
+        return unexpected_failure(account_url, error)
+
+
 async def download_url_group_parallel(
     urls: list[str],
     max_connections: int,
@@ -328,17 +354,20 @@ async def download_url_group_parallel(
         async with semaphore:
             if await checkpoint():
                 return url, "stopped"
-            result = await dump(
-                url,
-                1,
-                skip_videos,
-                skip_images,
-                album_idx=index,
-                album_total=total,
-                show_progress=show_item_progress,
-                show_summary=show_item_progress,
-                byte_progress=None if show_item_progress else progress.add_bytes,
-            )
+            try:
+                result = await dump(
+                    url,
+                    1,
+                    skip_videos,
+                    skip_images,
+                    album_idx=index,
+                    album_total=total,
+                    show_progress=show_item_progress,
+                    show_summary=show_item_progress,
+                    byte_progress=None if show_item_progress else progress.add_bytes,
+                )
+            except Exception as error:  # one broken item must not stop the whole batch
+                return url, unexpected_failure(url, error)
             return url, result
 
     tasks = [
@@ -432,16 +461,19 @@ async def download_album_group_parallel(
 
             if await checkpoint():
                 return album_data.url, "stopped"
-            result = await download_album_data(
-                album_data=album_data,
-                max_connections=per_album_connections,
-                album_idx=index,
-                album_total=total,
-                show_progress=show_album_progress,
-                show_summary=show_album_progress,
-                byte_progress=None if show_album_progress else progress.add_bytes,
-                file_result_callback=None if show_album_progress else on_file_done,
-            )
+            try:
+                result = await download_album_data(
+                    album_data=album_data,
+                    max_connections=per_album_connections,
+                    album_idx=index,
+                    album_total=total,
+                    show_progress=show_album_progress,
+                    show_summary=show_album_progress,
+                    byte_progress=None if show_album_progress else progress.add_bytes,
+                    file_result_callback=None if show_album_progress else on_file_done,
+                )
+            except Exception as error:  # one broken album must not stop the whole batch
+                return album_data.url, unexpected_failure(album_data.url, error)
             return album_data.url, result
 
     results: list[tuple[str, str]] = []
@@ -665,12 +697,7 @@ async def batch_download(
         if await checkpoint():
             break
         log(f"Аккаунт {index}/{len(account_links)}: {short_url(url)}")
-        result = await dump_account(
-            account_url=url,
-            max_connections=max_connections,
-            skip_videos=skip_videos,
-            skip_images=skip_images,
-        )
+        result = await dump_account_safely(url, max_connections, skip_videos, skip_images)
         if result == "stopped":
             break
         mark_final_result(url, result)
@@ -704,12 +731,7 @@ async def batch_download_accounts(
             log_warn("Остановлено по запросу: остальные аккаунты не проверены")
             break
         log(f"Аккаунт {index}/{len(account_links)}: {short_url(account_url)}")
-        result = await dump_account(
-            account_url=account_url,
-            max_connections=max_connections,
-            skip_videos=skip_videos,
-            skip_images=skip_images,
-        )
+        result = await dump_account_safely(account_url, max_connections, skip_videos, skip_images)
         if result == "stopped":
             log_warn("Остановлено по запросу: аккаунт будет проверен при следующем запуске")
             break
@@ -755,6 +777,11 @@ async def scan_accounts_to_pending(
             set_account_status(account_url, status)
             record_account_manifest(account_url, status)
             log_error(f"{account_name}: {friendly_error(error)}")
+            continue
+        except Exception as error:
+            unexpected_failure(account_url, error)
+            set_account_status(account_url, "failed")
+            record_account_manifest(account_url, "failed")
             continue
 
         known_urls = ready_urls | banned_urls | failed_urls | pending_urls

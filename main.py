@@ -4,9 +4,10 @@ import traceback
 
 from erome.config import (
     AUTO_SORT_LINKS,
-    CONFIG,
     DEFAULT_MAX_CONNECTIONS,
     DOWNLOADS_DIR,
+    SKIP_IMAGES,
+    SKIP_VIDEOS,
     SORT_ALBUMS_BY_SIZE,
 )
 from erome.console import (
@@ -18,8 +19,10 @@ from erome.console import (
 )
 from erome.storage import (
     ensure_runtime_dirs,
+    flush_manifest,
     read_accounts,
     read_pending,
+    reset_queue_cache,
     status_file_path,
 )
 from erome.tg_settings import settings_ready
@@ -61,12 +64,11 @@ def queue_summary() -> str:
 
 
 def show_banner() -> None:
-    skip_videos, skip_images = bool(CONFIG["skip_videos"]), bool(CONFIG["skip_images"])
-    if skip_videos and skip_images:
+    if SKIP_VIDEOS and SKIP_IMAGES:
         media = "ничего (включены оба фильтра)"
-    elif skip_videos:
+    elif SKIP_VIDEOS:
         media = "только фото"
-    elif skip_images:
+    elif SKIP_IMAGES:
         media = "только видео"
     else:
         media = "видео и фото"
@@ -96,12 +98,7 @@ def run_single_link() -> None:
         return
     result = asyncio.run(
         with_hotkeys(
-            dump(
-                url,
-                DEFAULT_MAX_CONNECTIONS,
-                bool(CONFIG["skip_videos"]),
-                bool(CONFIG["skip_images"]),
-            )
+            dump(url, DEFAULT_MAX_CONNECTIONS, SKIP_VIDEOS, SKIP_IMAGES)
         )
     )
     if result == "success":
@@ -120,8 +117,8 @@ def run_queue() -> None:
             batch_download(
                 read_pending(),
                 DEFAULT_MAX_CONNECTIONS,
-                bool(CONFIG["skip_videos"]),
-                bool(CONFIG["skip_images"]),
+                SKIP_VIDEOS,
+                SKIP_IMAGES,
                 AUTO_SORT_LINKS,
             )
         )
@@ -150,7 +147,7 @@ def run_scan() -> None:
 
 def run_telegram() -> None:
     try:
-        from erome.tg_bot import run_telegram_bot  # on demand: aiogram and Telethon are needed only here
+        from erome.tg_mode import run_telegram_bot  # on demand: aiogram and Telethon are needed only here
     except ImportError as exc:
         log_error(
             f"Для режима 5 не хватает пакета «{exc.name}». Запустите start.bat "
@@ -162,6 +159,7 @@ def run_telegram() -> None:
 
 def attempt(action) -> None:
     """Run one menu action; failures and Ctrl+C return to the menu instead of closing the program."""
+    reset_queue_cache()  # links/*.txt may have been edited by hand while the menu was open
     try:
         action()
     except KeyboardInterrupt:
@@ -171,6 +169,8 @@ def attempt(action) -> None:
         ui.idle()
         log_error(f"{type(exc).__name__}: {exc}")
         ui.line(traceback.format_exc().rstrip(), "dim")
+    finally:
+        flush_manifest()
 
 
 def main() -> int:

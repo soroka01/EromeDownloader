@@ -39,25 +39,78 @@ DEFAULT_CONFIG = {
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(
-            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        try:
+            CONFIG_PATH.write_text(
+                json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as error:
+            print(f"[WARN] Не удалось создать config.json: {error}. Использую настройки по умолчанию.")
         return DEFAULT_CONFIG.copy()
 
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        print(f"[WARN] config.json повреждён: {error}. Использую настройки по умолчанию.")
+    except (OSError, ValueError) as error:
+        print(f"[WARN] config.json не читается: {error}. Использую настройки по умолчанию.")
         return DEFAULT_CONFIG.copy()
 
     config = DEFAULT_CONFIG.copy()
-    if isinstance(loaded, dict):
-        config.update(loaded)
+    if not isinstance(loaded, dict):
+        print("[WARN] config.json должен быть JSON-объектом. Использую настройки по умолчанию.")
+        return config
+    for key in loaded:
+        if key not in DEFAULT_CONFIG:
+            print(f"[WARN] config.json: неизвестный параметр «{key}» — игнорирую.")
+    config.update(loaded)
     return config
 
 
 CONFIG = load_config()
+
+
+def _int_setting(name: str, minimum: int, maximum: int) -> int:
+    """Целое из config.json: не число — значение по умолчанию, число вне диапазона — ближайшее допустимое."""
+    default = DEFAULT_CONFIG[name]
+    value = CONFIG.get(name, default)
+    try:
+        number = None if isinstance(value, bool) else int(value)
+    except (TypeError, ValueError, OverflowError):
+        number = None
+    if number is None:
+        print(f"[WARN] config.json: «{name}» = {value!r} не число. Использую {default}.")
+        return default
+    if not minimum <= number <= maximum:
+        nearest = min(max(number, minimum), maximum)
+        print(f"[WARN] config.json: «{name}» = {value!r} вне диапазона {minimum}…{maximum}. Использую {nearest}.")
+        return nearest
+    return number
+
+
+def _bool_setting(name: str) -> bool:
+    """true/false из config.json; строки вроде "false" и числа 0/1 тоже понимаются, остальное — по умолчанию."""
+    default = DEFAULT_CONFIG[name]
+    value = CONFIG.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "on", "1", "да", "вкл"):
+            return True
+        if text in ("false", "no", "off", "0", "нет", "выкл"):
+            return False
+    print(f"[WARN] config.json: «{name}» = {value!r} не подходит (нужно true или false). Использую {default}.")
+    return default
+
+
+def _path_setting(name: str) -> str:
+    default = DEFAULT_CONFIG[name]
+    value = CONFIG.get(name, default)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    print(f"[WARN] config.json: «{name}» = {value!r} не подходит (нужен путь). Использую {default}.")
+    return default
 
 
 USER_AGENT = (
@@ -93,49 +146,58 @@ ACCOUNT_EXCLUDED_PREFIXES = (
 ACCOUNT_EXCLUDED_PATHS = {"/a"}
 
 
-CHUNK_SIZE = max(1, int(CONFIG["chunk_size_mb"])) * 1024 * 1024
+CHUNK_SIZE = _int_setting("chunk_size_mb", 1, 1024) * 1024 * 1024
 
 
-MAX_ATTEMPTS = int(CONFIG["max_attempts"])
+MAX_ATTEMPTS = _int_setting("max_attempts", 1, 100)
 
 
-PAGE_ATTEMPTS = int(CONFIG["page_attempts"])
+PAGE_ATTEMPTS = _int_setting("page_attempts", 1, 100)
 
 
-ACCOUNT_PAGE_CONNECTIONS = int(CONFIG["account_page_connections"])
+ACCOUNT_PAGE_CONNECTIONS = _int_setting("account_page_connections", 1, 256)
 
 
-ACCOUNT_MAX_PAGES = int(CONFIG["account_max_pages"])
+ACCOUNT_MAX_PAGES = _int_setting("account_max_pages", 1, 100_000)
 
 
-DEFAULT_MAX_CONNECTIONS = int(CONFIG["max_connections"])
+DEFAULT_MAX_CONNECTIONS = _int_setting("max_connections", 1, 256)
 
 
-MIN_CONNECTIONS_PER_PARALLEL_ALBUM = int(CONFIG["min_connections_per_parallel_album"])
+MIN_CONNECTIONS_PER_PARALLEL_ALBUM = _int_setting("min_connections_per_parallel_album", 1, 256)
 
 
-MAX_PARALLEL_ALBUMS = int(CONFIG["max_parallel_albums"])
+MAX_PARALLEL_ALBUMS = _int_setting("max_parallel_albums", 1, 256)
 
 
-AUTO_SORT_LINKS = bool(CONFIG["auto_sort_links"])
+AUTO_SORT_LINKS = _bool_setting("auto_sort_links")
 
 
-ALBUM_PREFETCH_CONNECTIONS = int(CONFIG["album_prefetch_connections"])
+ALBUM_PREFETCH_CONNECTIONS = _int_setting("album_prefetch_connections", 1, 256)
 
 
-SORT_ALBUMS_BY_SIZE = bool(CONFIG["sort_albums_by_size"])
+SORT_ALBUMS_BY_SIZE = _bool_setting("sort_albums_by_size")
 
 
-ALBUM_SIZE_PROBE_CONNECTIONS = int(CONFIG["album_size_probe_connections"])
+ALBUM_SIZE_PROBE_CONNECTIONS = _int_setting("album_size_probe_connections", 1, 256)
 
 
-ALBUM_SIZE_PROBE_TIMEOUT = int(CONFIG["album_size_probe_timeout"])
+ALBUM_SIZE_PROBE_TIMEOUT = _int_setting("album_size_probe_timeout", 1, 86_400)
 
 
-CONNECT_TIMEOUT = int(CONFIG["connect_timeout"])
+CONNECT_TIMEOUT = _int_setting("connect_timeout", 1, 86_400)
 
 
-IDLE_TIMEOUT = int(CONFIG["idle_timeout"])
+IDLE_TIMEOUT = _int_setting("idle_timeout", 1, 86_400)
+
+
+SKIP_VIDEOS = _bool_setting("skip_videos")
+
+
+SKIP_IMAGES = _bool_setting("skip_images")
+
+
+MANIFEST_PATH = _path_setting("manifest_path")
 
 
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504, 522, 524}

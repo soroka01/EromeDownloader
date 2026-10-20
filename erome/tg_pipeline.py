@@ -14,7 +14,7 @@ import shutil
 import time
 from pathlib import Path
 
-from erome.config import CONFIG, DEFAULT_MAX_CONNECTIONS, DOWNLOADS_DIR, UNAVAILABLE_STATUSES
+from erome.config import DEFAULT_MAX_CONNECTIONS, DOWNLOADS_DIR, SKIP_IMAGES, SKIP_VIDEOS, UNAVAILABLE_STATUSES
 from erome.console import (
     DownloadSpeed,
     checkpoint,
@@ -29,7 +29,7 @@ from erome.console import (
 )
 from erome.downloader import download_jobs
 from erome.models import AlbumData, AlbumFetchError, DownloadResult, FileJob
-from erome.net import _collect_album_data, collect_account_album_urls
+from erome.net import collect_account_album_urls, collect_album_data
 from erome.tg_media import SendItem, prepare_item
 from erome.tg_settings import TelegramSettings
 from erome.tg_state import (
@@ -42,17 +42,10 @@ from erome.tg_state import (
     file_key,
     random_id_for,
 )
-from erome.tg_userbot import (
-    ALBUM_MAX_ITEMS,
-    TRANSIENT_ERRORS,
-    DestinationError,
-    RetryLater,
-    Userbot,
-    describe_error,
-    task_is_cancelling,
-)
+from erome.tg_transport import RetryLater, describe_error, task_is_cancelling
+from erome.tg_userbot import ALBUM_MAX_ITEMS, TRANSIENT_ERRORS, DestinationError, Userbot
 from erome.ui import human_size, plural
-from erome.urls import _clean_album_title, account_name_from_url, build_download_jobs
+from erome.urls import account_name_from_url, build_download_jobs, safe_name
 
 LOG = logging.getLogger("erome.tg")
 
@@ -61,13 +54,20 @@ BATCH_SIZE = ALBUM_MAX_ITEMS
 MAX_SEND_ATTEMPTS = 3
 TRANSIENT_PAUSE_SECONDS = 10
 MAX_TRANSIENT_STREAK = 30  # failures with a live connection tolerated in a row (5 minutes)
-DESTINATION_RETRY_SECONDS = 60
+DESTINATION_RETRY_SECONDS = 60  # first look at a refusing group; doubles up to the maximum while it keeps refusing
+DESTINATION_RETRY_MAX_SECONDS = 900
 SCAN_ATTEMPTS = 3
+JOB_RETRY_SECONDS = (60, 180, 600)  # waits between the tries of a job whose page could not be read
+MAX_JOB_TRIES = len(JOB_RETRY_SECONDS) + 1
 _STAGING_CODE_RE = re.compile(r"\[([^\[\]]+)\]$")
 
 
 class JobFailed(Exception):
     """The job cannot continue; the message is shown to the user."""
+
+
+class RetryJob(Exception):
+    """The site did not answer properly: the job waits for a while and starts again (a few times at most)."""
 
 
 class StopRequested(Exception):
@@ -112,6 +112,17 @@ def code_of(album_url: str) -> str:
     return album_url.rstrip("/").rsplit("/", 1)[-1]
 
 
+def refusal_text(reason: str) -> str:
+    """How a refusal reads in a job note: a bare error code gets the word «Telegram», a phrase stands alone."""
+    return (reason if " " in reason else f"Telegram: {reason}")[:80]
+
+
+def wait_text(seconds: float) -> str:
+    """A pause in words for log lines: «45 с», «3 мин»."""
+    seconds = max(0, int(seconds + 0.5))
+    return f"{seconds} с" if seconds < 90 else f"{round(seconds / 60)} мин"
+
+
 class Pipeline:
     def __init__(
         self,
@@ -133,7 +144,10 @@ class Pipeline:
         self._stopping = False
         self._failures: dict[str, str] = {}  # file url -> why it was not delivered (current job)
         self._gone: set[str] = set()  # files the site reports as removed: not worth another try
+        self._settled: set[str] = set()  # files Telegram refused for good (written to the ledger)
         self._last_blocked = ""
+        self._last_block_delay = 0.0
+        self._block_streak = 0  # consecutive waits for a refusing group: the pause grows with it
 
     # ----- control (called by the bot) ----------------------------------------------------------
 
@@ -182,6 +196,8 @@ class Pipeline:
         self.progress = Progress(job)
         self._failures = {}
         self._gone = set()
+        self._settled = set()
+        self._block_streak = 0
         task = asyncio.ensure_future(self._run_job(job))
         self._job_task = task
         finished = True
@@ -203,6 +219,8 @@ class Pipeline:
         except StopRequested:
             self.state.requeue(job)
             finished = False
+        except RetryJob as exc:
+            self._defer(job, str(exc))
         except JobFailed as exc:
             self._finish(job, FAILED, str(exc))
         except Exception as exc:
@@ -219,6 +237,16 @@ class Pipeline:
             self.waiting = ""
             if finished and staging is not None and self.settings.delete_after_upload:
                 shutil.rmtree(staging, ignore_errors=True)
+
+    def _defer(self, job: Job, reason: str) -> None:
+        """The site did not answer properly: the job waits (1, 3, 10 minutes) while the others go on, then starts again."""
+        label = shorten_text(job.title or short_url(job.url), 70)
+        if job.tries + 1 >= MAX_JOB_TRIES:
+            self._finish(job, FAILED, f"{reason} (попыток: {MAX_JOB_TRIES})")
+            return
+        delay = JOB_RETRY_SECONDS[job.tries]
+        self.state.defer(job, delay, reason)
+        log_warn(f"«{label}»: {reason}. Повторю через {wait_text(delay)}")
 
     def _finish(self, job: Job, status: str, note: str) -> None:
         self.state.finish(job, status, note)
@@ -250,6 +278,8 @@ class Pipeline:
         except AlbumFetchError as error:
             if error.status in UNAVAILABLE_STATUSES:
                 raise JobFailed("профиль недоступен (удалён или закрыт)") from None
+            if error.status is None:  # no answer or pages missing: the site may be fine in a few minutes
+                raise RetryJob(f"не удалось прочитать профиль: {friendly_error(error)}") from None
             raise JobFailed(f"не удалось открыть профиль: {friendly_error(error)}") from None
         if not album_urls:
             raise JobFailed("в профиле не найдено альбомов")
@@ -270,22 +300,22 @@ class Pipeline:
     # ----- album -----------------------------------------------------------------------------------
 
     def _staging_dir(self, album: AlbumData) -> Path:
-        title = _clean_album_title(album.title)[:80].strip(". ") or "album"
+        title = safe_name(album.title)[:80].strip(". ") or "album"
         return self.staging / f"{title} [{code_of(album.url)}]"
 
     async def _scan_album(self, job: Job) -> AlbumData:
-        last_error = ""
+        last_error, last_status = "", None
         for attempt in range(1, SCAN_ATTEMPTS + 1):
             try:
-                return await _collect_album_data(
-                    job.url, bool(CONFIG["skip_videos"]), bool(CONFIG["skip_images"])
-                )
+                return await collect_album_data(job.url, SKIP_VIDEOS, SKIP_IMAGES)
             except AlbumFetchError as error:
                 if error.status in UNAVAILABLE_STATUSES:
                     raise JobFailed("альбом недоступен (удалён или закрыт)") from None
-                last_error = friendly_error(error)
+                last_error, last_status = friendly_error(error), error.status
             if attempt < SCAN_ATTEMPTS:
                 await self._sleep(5 * attempt)
+        if last_status is None:  # no answer at all: the site may be fine in a few minutes
+            raise RetryJob(f"страница альбома не открывается: {last_error}")
         raise JobFailed(f"страница альбома не открывается: {last_error}")
 
     async def _run_album(self, job: Job) -> tuple[str, str] | None:
@@ -299,11 +329,26 @@ class Pipeline:
         staging = self._staging_dir(album)
         progress.staging = staging
         sent_keys = self.state.sent_keys(album.url)
+        present = {file_key(url) for url in album.urls}
+        if self.state.refused(album.url, 0):
+            await self._wait_for_telegram()  # whether a refusal still holds depends on the upload limit (Premium)
+        # Refused by Telegram earlier (and not forgotten by /resend): downloading them again would only be refused again.
+        turned_down = {
+            key: reason
+            for key, reason in self.state.refused(album.url, self.userbot.max_upload_bytes).items()
+            if key in present
+        }
         # Names are fixed for the whole album, so batches never collide in the staging folder.
-        todo = [item for item in build_download_jobs(album.urls, staging) if file_key(item.url) not in sent_keys]
+        todo = [
+            item
+            for item in build_download_jobs(album.urls, staging)
+            if file_key(item.url) not in sent_keys and file_key(item.url) not in turned_down
+        ]
         job.files_total = progress.files_total = len(todo)
         if not todo:
             self.state.mark_album_done(album.url, album.title)
+            if turned_down:
+                return PARTIAL, self._turned_down_note("всё отправлено", turned_down)
             return DONE, "всё уже было отправлено"
         log(
             f"«{shorten_text(album.title, 60)}»: к отправке {len(todo)} из {album.media_count} "
@@ -357,17 +402,30 @@ class Pipeline:
         sent = progress.files_sent
         if sent >= len(todo):
             self.state.mark_album_done(album.url, album.title)
-            return DONE, f"{sent} {plural(sent, 'файл', 'файла', 'файлов')}, {human_size(job.bytes_sent)}"
+            note = f"{sent} {plural(sent, 'файл', 'файла', 'файлов')}, {human_size(job.bytes_sent)}"
+            if turned_down:
+                return PARTIAL, self._turned_down_note(note, turned_down)
+            return DONE, note
         delivered_keys = self.state.sent_keys(album.url)
         left = [item for item in todo if file_key(item.url) not in delivered_keys]
-        if left and all(item.url in self._gone for item in left):
-            # Only files the site has removed are missing: more attempts are pointless, profile scans may skip it.
+        if left and all(item.url in self._gone or item.url in self._settled for item in left):
+            # Only files the site has removed or Telegram refuses are missing: more attempts are pointless,
+            # profile scans may skip the album.
             self.state.mark_album_done(album.url, album.title)
         missing = len(todo) - sent
         reasons = sorted({reason for reason in self._failures.values() if reason})
         detail = f" ({'; '.join(reasons[:2])})" if reasons else ""
         note = f"отправлено {sent} из {len(todo)}, не удалось {missing}{detail}"
         return (PARTIAL if sent else FAILED), note
+
+    @staticmethod
+    def _turned_down_note(prefix: str, turned_down: dict[str, str]) -> str:
+        count = len(turned_down)
+        reasons = "; ".join(sorted(set(turned_down.values()))[:2])
+        return (
+            f"{prefix}, кроме {count} {plural(count, 'файла', 'файлов', 'файлов')} "
+            f"({reasons}); /resend — попробовать снова"
+        )
 
     async def _fetch(self, album: AlbumData, batch: list[FileJob], staging: Path) -> dict[str, DownloadResult]:
         progress = self.progress
@@ -445,6 +503,7 @@ class Pipeline:
             )
         )
         remaining: list[SendItem] = list(prepared)
+        sizes = {item.key: item.size for item in prepared}
         caption_used = False  # the title goes out once, with the first message that really arrived
         undelivered: dict[str, str] = {}
         attempts = 0
@@ -455,6 +514,8 @@ class Pipeline:
             nonlocal attempts, transient_streak, caption_used
             attempts = transient_streak = 0
             caption_used = True
+            self._block_streak = 0
+            self._last_blocked, self._last_block_delay = "", 0.0
             nbytes = sum(item.size for item in done)
             self.state.record_batch(album.url, [item.key for item in done], nbytes)
             job.files_sent += len(done)
@@ -511,7 +572,17 @@ class Pipeline:
                 remaining[:] = [item for item in remaining if item.key not in dropped]
                 continue
             for key, reason in refused.items():
-                undelivered[url_by_key[key]] = f"Telegram: {reason}"[:80]
+                undelivered[url_by_key[key]] = refusal_text(reason)
+            # Only a refusal that is the file's own fault is written down: an empty file may be a bad download, and
+            # the rest (a flaky link, the chat's rules) can pass the next time.
+            lasting = {
+                key: reason
+                for key, reason in refused.items()
+                if sizes.get(key, 0) > 0 and getattr(reason, "lasting", False)
+            }
+            if lasting:
+                self.state.record_refused(album.url, lasting, self.userbot.max_upload_bytes)
+                self._settled.update(url_by_key[key] for key in lasting)
             handled = {item.key for item in chunk}
             remaining[:] = [item for item in remaining if item.key not in handled]
             attempts = transient_streak = 0
@@ -555,13 +626,19 @@ class Pipeline:
             self.waiting = ""
 
     async def _block(self, reason: str) -> None:
-        """The target chat refuses our messages: keep the queue and look again in a minute."""
+        """The target chat refuses our messages: keep the queue and look again later (1, 2, 4 ... 15 minutes).
+
+        Each look costs an upload once the kept file handles have expired, so a group that stays closed for hours
+        must not be tried every minute.
+        """
         self.blocked = reason
-        if reason != self._last_blocked:
-            self._last_blocked = reason
-            log_error(f"Нет доступа к группе/теме: {reason}. Проверю снова через минуту")
+        delay = min(DESTINATION_RETRY_SECONDS * 2**self._block_streak, DESTINATION_RETRY_MAX_SECONDS)
+        self._block_streak += 1
+        if reason != self._last_blocked or delay != self._last_block_delay:  # the line is repeated as the wait grows
+            self._last_blocked, self._last_block_delay = reason, delay
+            log_error(f"Нет доступа к группе/теме: {reason}. Проверю снова через {wait_text(delay)}")
         try:
-            await self._sleep(DESTINATION_RETRY_SECONDS)
+            await self._sleep(delay)
         finally:
             self.blocked = ""
 
