@@ -381,10 +381,10 @@ async def listen_keys(control: RunControl) -> None:
 
 
 @asynccontextmanager
-async def hotkeys():
+async def hotkeys(control: RunControl | None = None):
     """Enable hot keys (interactive terminal only) for the duration of one running action."""
     global _control
-    control = RunControl()
+    control = control or RunControl()
     _control = control
     task = None
     if sys.stdin is not None and sys.stdin.isatty():

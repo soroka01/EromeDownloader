@@ -1,0 +1,15 @@
+{
+  "bot_token": "PUT_BOT_TOKEN_HERE",
+  "owner_ids": [
+    123456789
+  ],
+  "account_id": null,
+  "chat_id": -1001234567890,
+  "thread_id": 0,
+  "api_id": "PUT_API_ID_HERE",
+  "api_hash": "PUT_API_HASH_HERE",
+  "credentials_config_path": "",
+  "session_path": "data/telegram",
+  "delete_after_upload": true,
+  "upload_connections": 12
+}

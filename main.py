@@ -22,6 +22,7 @@ from erome.storage import (
     read_pending,
     status_file_path,
 )
+from erome.tg_settings import settings_ready
 from erome.ui import plural, ui
 from erome.urls import choose_parallel_album_count
 from erome.workflow import (
@@ -38,6 +39,7 @@ MENU = (
     ("2", "Очередь", "скачать всё из links/pending.txt"),
     ("3", "Аккаунты", "проверить links/accs.txt и скачать новые альбомы"),
     ("4", "Поиск новых", "найти новые альбомы аккаунтов и добавить в pending.txt"),
+    ("5", "Telegram-бот", "ссылки из чата с ботом → скачать → отправить в группу"),
     ("0", "Выход", ""),
 )
 
@@ -78,6 +80,7 @@ def show_banner() -> None:
     )
     ui.field("Скачивать", media)
     ui.field("Очередь", queue_summary())
+    ui.field("Telegram", "бот настроен (пункт 5)" if settings_ready() else "не настроен (пункт 5)")
 
 
 def show_menu() -> None:
@@ -145,6 +148,18 @@ def run_scan() -> None:
     )
 
 
+def run_telegram() -> None:
+    try:
+        from erome.tg_bot import run_telegram_bot  # on demand: aiogram and Telethon are needed only here
+    except ImportError as exc:
+        log_error(
+            f"Для режима 5 не хватает пакета «{exc.name}». Запустите start.bat "
+            "или выполните: python -m pip install -r requirements.txt"
+        )
+        return
+    run_telegram_bot()
+
+
 def attempt(action) -> None:
     """Run one menu action; failures and Ctrl+C return to the menu instead of closing the program."""
     try:
@@ -167,6 +182,7 @@ def main() -> int:
         "2": run_queue,
         "3": run_accounts,
         "4": run_scan,
+        "5": run_telegram,
     }
     show_banner()
     show_menu()

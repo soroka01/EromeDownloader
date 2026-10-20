@@ -1,3 +1,8 @@
 aiofiles==25.1.0
+aiogram>=3.30.0,<4
 aiohttp==3.14.3
 beautifulsoup4==4.15.0
+cryptg>=0.5
+imageio-ffmpeg>=0.6,<1
+qrcode>=8.0
+Telethon>=1.45,<1.46

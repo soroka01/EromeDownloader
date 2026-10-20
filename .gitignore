@@ -9,3 +9,9 @@ venv/
 downloads/
 links/
 *.log
+
+# Telegram mode: bot token, userbot session, logs
+telegram.json*
+data/
+*.session
+*.session-journal

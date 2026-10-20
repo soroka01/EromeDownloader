@@ -429,7 +429,8 @@ async def collect_album_data_batch(
     return albums, failures
 
 
-async def collect_account_album_urls(account_url: str) -> list[str]:
+async def collect_account_album_urls(account_url: str, show_progress: bool = True) -> list[str]:
+    """Album links of a profile in page order (as listed on the site, newest first)."""
     account_url = normalize_account_url(account_url)
     async with make_session(ACCOUNT_PAGE_CONNECTIONS) as session:
         first_html = await _fetch_text_page(session, account_url, "account page")
@@ -457,18 +458,24 @@ async def collect_account_album_urls(account_url: str) -> list[str]:
             )
             for page_url in page_urls
         ]
+        albums_by_page: dict[str, list[str]] = {}
+
         def on_page(item: tuple[str, list[str]] | Exception) -> None:
             if isinstance(item, Exception):
                 log_warn(f"account page: {friendly_error(item)}")
             else:
-                album_urls.extend(item[1])
+                albums_by_page[item[0]] = item[1]
 
-        with LiveProgress(
+        with optional_progress(
+            show_progress,
             label=f"{account_name_from_url(account_url)}: страницы аккаунта",
             total=len(tasks),
             unit="страниц",
         ) as pages_progress:
             await drain_tasks(tasks, on_page, pages_progress)
+
+        for page_url in page_urls:  # pages finish in any order, the result keeps the site's order
+            album_urls.extend(albums_by_page.get(page_url, []))
 
     return dedupe_preserve_order(album_urls)
 

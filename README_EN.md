@@ -11,14 +11,15 @@
 
 ## 📌 Overview
 
-The program downloads public Erome albums, individual files and new albums from accounts. It supports queues, parallel downloads, resuming and account tracking. The interface is a console menu: after launch the main menu is shown and you pick a mode by number.
+The program downloads public Erome albums, individual files and new albums from accounts. It supports queues, parallel downloads, resuming and account tracking. The interface is a console menu: after launch the main menu is shown and you pick a mode by number. One mode is a Telegram bot: you send it links to albums and profiles, and it downloads them and posts them to your group.
 
 > [!NOTE]
 > Erome authentication, cookies and private albums are not supported.
 
 ## ✨ Features
 
-- Four modes: single link, queue, account check, scan-only for new albums
+- Five modes: single link, queue, account check, scan-only for new albums, Telegram bot
+- Telegram bot: album and profile links from a chat → download → posting to a group or topic from your own account; send as many links as you like without waiting for the previous ones
 - Parallel downloading of multiple albums and files
 - Resuming via `.part` files and HTTP Range
 - Tracking new account albums (`links/accs.txt`)
@@ -43,6 +44,7 @@ Modes:
 | `2` | `links/pending.txt` | Processes the queue, retries failures and updates status files |
 | `3` | `links/accs.txt` | Checks tracked accounts and downloads new albums |
 | `4` | `links/accs.txt` | Only finds new albums and appends them to `pending.txt` |
+| `5` | Telegram bot chat | Takes links, downloads and posts them to a group, see [the section below](#-telegram-bot-mode-5) |
 
 - Mode `1` writes to the manifest but does not maintain `ready.txt`, `failed.txt` and `banned.txt` as a batch queue.
 - Mode `3` always collects both images and videos: `skip_images` and `skip_videos` are not applied to it.
@@ -50,7 +52,7 @@ Modes:
 
 ### Console controls
 
-- Main menu: `1`-`4` are the modes from the table above, `0` (or `q`, `exit`) quits. Empty input selects `1`. The menu is shown again after every action.
+- Main menu: `1`-`5` are the modes from the table above, `0` (or `q`, `exit`) quits. Empty input selects `1`. The menu is shown again after every action.
 - `Ctrl+C` interrupts the current action and returns to the menu; `.part` files and queues are kept, so unfinished work continues on the next run.
 - While running, a single progress line is updated at the bottom: links, albums and files processed, transferred size, speed and time left.
 - Hot keys (interactive console only, also work on a Russian keyboard layout): `S` - status, `P` - pause, `Q` - stop after the current item. Pause and stop take effect between items: queue links and albums, accounts; an album or file already in progress runs to completion. While downloading a single album or file (mode `1`) only `S` works. Unprocessed items stay in the queue.
@@ -169,34 +171,96 @@ One URL per line; blank lines and lines starting with `#` are ignored by batch m
 > [!WARNING]
 > The importer **replaces the contents** of `links/pending.txt` with the found links instead of merging them. Back up the old file or merge lists manually.
 
+## 🤖 Telegram bot (mode 5)
+
+Mode 5 takes Erome album and profile links in a chat with a bot, downloads them and posts them to a group (into the chosen forum topic) from your own account, through a Telethon "userbot". You can send as many links as you like at any time: everything is queued and processed in order, there is no need to wait for the previous one to finish.
+
+```mermaid
+flowchart LR
+    U["Links in the bot chat"] --> Q["Queue<br/>links/tg_queue.json"]
+    Q --> D["Download<br/>downloads/_telegram/"]
+    D --> S["Userbot posts<br/>to the group / topic"]
+    S --> L["Ledger of what was sent<br/>links/tg_sent.jsonl"]
+```
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy its token.
+2. Start the program and choose item `5`. If `telegram.json` does not exist yet it is created from `telegram.example.json`, and the program asks for the token itself. Fill in the other fields (table below); you can also prepare the file by hand.
+3. `api_id` and `api_hash` come from [my.telegram.org](https://my.telegram.org) (API development tools). Instead of them you can set `credentials_config_path` — a path to another JSON file with a `telegram` block (`api_id`, `api_hash`).
+4. On the first run a QR code is printed: on your phone open "Settings → Devices → Link Desktop Device" and scan it **with the account that should post**. If `account_id` is set and a different account signs in, the session is closed and the sign-in has to be repeated. The cloud password (2FA), if any, is typed in the console. The session is kept in `data/telegram.session`, so you sign in only once.
+5. Send the bot `/start` and then your links.
+
+`telegram.json` (template: `telegram.example.json`):
+
+| Field | Description |
+| --- | --- |
+| `bot_token` | Bot token from @BotFather |
+| `owner_ids` | IDs of the accounts allowed to use the bot; everyone else is ignored (their ID is printed to the console once) |
+| `account_id` | ID of the sending account: checked at sign-in; `null` disables the check |
+| `chat_id` | Group ID, e.g. `-1001234567890` |
+| `thread_id` | Forum topic ID (the number at the end of a `t.me/c/…/<thread_id>` link); `0` posts to the main chat |
+| `api_id`, `api_hash` | Telegram application credentials; may stay empty when `credentials_config_path` is set |
+| `credentials_config_path` | Path to a JSON file with `api_id` / `api_hash` (`telegram` block), e.g. from another project |
+| `session_path` | Session file without extension, `data/telegram` by default |
+| `delete_after_upload` | Delete local files right after Telegram accepted them (`true` by default) |
+| `upload_connections` | Upper limit of connections when sending big files, 1-24 (`12` by default) |
+
+### Usage
+
+- Send album links (`erome.com/a/…`) and profile links (`erome.com/name`): one per message or several in a single message. The bot deletes your message and shows its state in a single panel message that updates itself: the current album (downloaded and sent counts, speed, time left), the queue and recently finished items (Moscow time).
+- Panel buttons: pause / resume, cancel the current album, clear the queue (press twice).
+- Commands: `/start` — instructions, `/queue` — bring the panel back to the bottom of the chat, `/resend link` — post an album again.
+- A profile expands into the albums that were not sent to the group yet, oldest first; albums that were fully sent are skipped. To pick up new files in an old album, send the album link itself.
+- In the console: `S` — status, `P` — pause, `Q` — stop after the current batch of files, `Ctrl+C` — interrupt at once. The queue is stored on disk and continues on the next run.
+
+### What is sent and how
+
+- Photos and videos go out as albums of up to 10, with a caption (title and album link) on the first file. Videos are sent with a preview and play without downloading the whole file. GIFs and photos that do not fit Telegram's photo limits go out as separate messages or files.
+- While one batch (up to 10 files) is being posted, the next one is downloaded. Files live in `downloads/_telegram/`, not in the main `downloads/` archive.
+- The ledger `links/tg_sent.jsonl` remembers every batch Telegram accepted, and every message has a fixed `random_id`: a repeated link, a lost connection or a restart at any moment never creates duplicates. Only what is missing is sent again.
+- Files that failed to download are tried once more at the end of the album; if some never arrive the album is marked as partly sent, and sending the link again fetches the rest.
+- Telegram's file limit is 2 GB, 4 GB for a Premium account.
+- The mode can run in one window only.
+
 ## 🗂️ Project structure
 
 ```text
 EromeDownloader/
-├── main.py            # entry point, mode menu
-├── extract_links.py   # bookmarks link importer
-├── start.bat          # Windows launcher (.venv + dependencies)
-├── config.json        # settings
-├── requirements.txt   # dependencies
+├── main.py                # entry point, mode menu
+├── extract_links.py       # bookmarks link importer
+├── start.bat              # Windows launcher (.venv + dependencies)
+├── config.json            # settings
+├── telegram.example.json  # template of the Telegram mode settings
+├── telegram.json          # your Telegram mode settings: token and IDs (not in Git)
+├── requirements.txt       # dependencies
 ├── erome/
-│   ├── config.py      # settings loading
-│   ├── console.py     # logs, progress line, hot keys
-│   ├── downloader.py  # file downloading
-│   ├── models.py      # data models
-│   ├── net.py         # networking
-│   ├── storage.py     # queues, statuses, manifest
-│   ├── ui.py          # terminal UI: colours, status line, prompts
-│   ├── urls.py        # URL parsing and sorting
-│   └── workflow.py    # mode 1-4 workflows
-├── downloads/         # downloaded files (not in Git)
-└── links/             # queues and manifest (not in Git)
+│   ├── config.py          # settings loading
+│   ├── console.py         # logs, progress line, hot keys
+│   ├── downloader.py      # file downloading
+│   ├── models.py          # data models
+│   ├── net.py             # networking
+│   ├── storage.py         # queues, statuses, manifest
+│   ├── ui.py              # terminal UI: colours, status line, prompts
+│   ├── urls.py            # URL parsing and sorting
+│   ├── workflow.py        # mode 1-4 workflows
+│   ├── tg_settings.py     # mode 5: telegram.json, token, credentials
+│   ├── tg_state.py        # mode 5: queue and ledger of what was sent
+│   ├── tg_media.py        # mode 5: file kind, video metadata, thumbnails
+│   ├── tg_userbot.py      # mode 5: userbot (Telethon), QR sign-in, sending
+│   ├── tg_pipeline.py     # mode 5: download → send
+│   └── tg_bot.py          # mode 5: bot (aiogram), panel, startup
+├── downloads/             # downloaded files; _telegram/ holds mode 5 scratch files (not in Git)
+├── links/                 # queues, manifest, tg_queue.json and tg_sent.jsonl (not in Git)
+└── data/                  # Telegram session and mode 5 log (not in Git)
 ```
 
 ## 🔒 Security & privacy
 
-- No passwords, cookies or API keys are required.
+- Modes 1-4 need no passwords, cookies or API keys.
 - A direct URL is not restricted to the Erome domain; use trusted links only.
-- `downloads/`, `links/`, `.venv/`, `.env` and logs are excluded from Git.
+- `downloads/`, `links/`, `data/`, `telegram.json`, `.venv/`, `.env`, session files and logs are excluded from Git.
+- The bot token and the session file `data/telegram.session` give full access to the bot and the account: never publish them. If a token leaks, reissue it with @BotFather (`/revoke`).
 - The manifest may contain source URLs and local file names — consider this before sharing it.
 
 ## ⚠️ Limitations
@@ -205,6 +269,7 @@ EromeDownloader/
 - Resuming works only if the server supports `Range`; otherwise the file is downloaded again.
 - Size may stay unknown if the server does not report it via `HEAD` or a range response.
 - A corrupted manifest is moved to a file with a `.bad` suffix.
+- Mode 5 is bound by Telegram's limits (upload speed, message rate in a group): when throttled the program waits and carries on by itself.
 
 ## 📄 License
 

@@ -66,10 +66,35 @@ async def _download(
     byte_progress: Callable[[int], None] | None = None,
     file_result_callback: FileResultCallback | None = None,
 ) -> DownloadSummary:
+    return await download_jobs(
+        album,
+        build_download_jobs(urls, download_path),
+        max_connections,
+        download_path,
+        desc=desc,
+        show_progress=show_progress,
+        show_summary=show_summary,
+        byte_progress=byte_progress,
+        file_result_callback=file_result_callback,
+    )
+
+
+async def download_jobs(
+    album: str,
+    jobs: list[FileJob],
+    max_connections: int,
+    download_path: Path,
+    desc: str = "Альбом",
+    show_progress: bool = True,
+    show_summary: bool = True,
+    byte_progress: Callable[[int], None] | None = None,
+    file_result_callback: FileResultCallback | None = None,
+    record: bool = True,
+) -> DownloadSummary:
+    """Download prepared jobs; `record=False` leaves the shared manifest alone (Telegram mode keeps its own ledger)."""
     ensure_runtime_dirs()
     download_path.mkdir(parents=True, exist_ok=True)
 
-    jobs = build_download_jobs(urls, download_path)
     if not jobs:
         return DownloadSummary(results=[])
 
@@ -110,7 +135,8 @@ async def _download(
             await drain_tasks(tasks, on_result, album_progress)
 
     summary = DownloadSummary(results=results)
-    record_file_results(album, download_path, results)
+    if record:
+        record_file_results(album, download_path, results)
     if show_summary:
         if summary.failed_count or summary.banned_count:
             log_warn(
