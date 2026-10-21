@@ -27,6 +27,7 @@ PROBE_TIMEOUT_SECONDS = 60
 THUMBNAIL_TIMEOUT_SECONDS = 60
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 _VIDEO_RE = re.compile(r"Stream #\d+:\d+.*?Video:.*?,\s*(\d{2,5})x(\d{2,5})")
+_AUDIO_RE = re.compile(r"Stream #\d+:\d+[^\n]*?: Audio:")
 _ROTATION_RE = re.compile(r"rotation of (-?\d+(?:\.\d+)?) degrees")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _SOF_MARKERS = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
@@ -37,6 +38,7 @@ class VideoInfo:
     duration: float
     width: int
     height: int
+    has_audio: bool = True
 
 
 @dataclass
@@ -57,6 +59,11 @@ class SendItem:
     uploaded_at: float = 0.0
     thumb_refused: bool = False  # Telegram did not take the thumbnail: the video goes out without one
     stale_resets: int = 0  # times Telegram refused the kept handle (the file is re-uploaded; twice = the file is bad)
+
+    @property
+    def silent(self) -> bool:
+        """A video known to have no audio track (when nothing could be probed, nothing is assumed)."""
+        return self.kind == "video" and self.video is not None and not self.video.has_audio
 
     def cleanup_paths(self) -> list[Path]:
         return [path for path in (self.path, self.thumb) if path is not None]
@@ -89,11 +96,8 @@ def _run_ffmpeg(args: list[str], timeout: int) -> subprocess.CompletedProcess[by
         return None
 
 
-def probe_video(path: Path) -> VideoInfo | None:
-    completed = _run_ffmpeg(["-i", str(path)], PROBE_TIMEOUT_SECONDS)
-    if completed is None:
-        return None
-    text = completed.stderr.decode("utf-8", errors="replace")
+def parse_probe(text: str) -> VideoInfo | None:
+    """Video facts from what `ffmpeg -i file` prints (it has no ffprobe to ask)."""
     duration = _DURATION_RE.search(text)
     video = _VIDEO_RE.search(text)
     if duration is None or video is None:
@@ -104,7 +108,14 @@ def probe_video(path: Path) -> VideoInfo | None:
     if rotation and round(abs(float(rotation.group(1)))) % 180 == 90:
         width, height = height, width  # the player shows the rotated picture
     total = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-    return VideoInfo(total, width, height)
+    return VideoInfo(total, width, height, has_audio=_AUDIO_RE.search(text) is not None)
+
+
+def probe_video(path: Path) -> VideoInfo | None:
+    completed = _run_ffmpeg(["-i", str(path)], PROBE_TIMEOUT_SECONDS)
+    if completed is None:
+        return None
+    return parse_probe(completed.stderr.decode("utf-8", errors="replace"))
 
 
 def make_thumbnail(path: Path, destination: Path, at_seconds: float = 1.0) -> Path | None:

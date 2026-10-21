@@ -226,7 +226,7 @@ flowchart LR
 
 ### What is sent and how
 
-- Photos and videos go out as albums of up to 10, with a caption (title and album link) on the first file. Videos are sent with a preview and play without downloading the whole file. GIFs and photos that do not fit Telegram's photo limits go out as separate messages or files.
+- Photos and videos go out as albums of up to 10, with a caption (title and album link) on the first file. Videos are sent with a preview and play without downloading the whole file. GIFs and photos that do not fit Telegram's photo limits go out as separate messages or files. A video without sound is marked for Telegram (`nosound_video`): otherwise Telegram takes it for a GIF and refuses the whole album. If Telegram refuses anyway, the album goes out file by file, and the following clips without sound go out as separate messages while everything else is still grouped into an album.
 - While one batch (up to 10 files) is being posted, the next one is downloaded. Files live in `downloads/_telegram/`, not in the main `downloads/` archive.
 - The ledger `links/tg_sent.jsonl` remembers every batch Telegram accepted, and every message has a fixed `random_id`: a repeated link, a lost connection or a restart at any moment never creates duplicates. Only what is missing is sent again.
 - Files that failed to download are tried once more at the end of the album; if some never arrive the album is marked as partly sent, and sending the link again fetches the rest.

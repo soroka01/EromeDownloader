@@ -28,6 +28,18 @@ from telethon.tl.alltlobjects import LAYER
 from erome.tg_settings import TelegramSettings
 
 LOG = logging.getLogger("erome.tg")
+_LANE_LOG = logging.getLogger("erome.tg.lane")
+_LANE_LOG.addHandler(logging.NullHandler())
+_LANE_LOG.propagate = False
+
+
+class _LaneLoggers(dict):
+    """Loggers of the extra upload connections. Telethon words the ordinary end of such a connection (the server, or
+    something between, closing it) as a WARNING and an ERROR; a real loss is reported by the pool in its own words."""
+
+    def __missing__(self, key: str) -> logging.Logger:
+        return _LANE_LOG
+
 
 STATE_STARTING = "starting"
 STATE_READY = "ready"
@@ -100,7 +112,7 @@ def error_classes(*names: str) -> tuple[type[BaseException], ...]:
 ERROR_CATEGORIES = frozenset(
     {"BAD_REQUEST", "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "FLOOD", "INTERNAL", "SEE_OTHER", "NOT_ACCEPTABLE", "ABORTED"}
 )
-_CAUSE_SUFFIX_RE = re.compile(r"\s*\(caused by [^)]*\)\s*$")
+_CAUSE_SUFFIX_RE = re.compile(r"\s*\(caused by .*\)\s*$", re.DOTALL)  # greedy: the request in it has brackets of its own
 _WORD_BREAK_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 
@@ -114,12 +126,14 @@ def error_code(exc: BaseException) -> str:
 
 
 def describe_error(exc: BaseException) -> str:
-    """One line about a failure for logs: the RPC code of a generic error, else Telethon's own description."""
+    """One line about a failure for logs: the RPC code of a generic error, else the code and Telethon's description."""
     message = str(getattr(exc, "message", "") or "")
     if message and message not in ERROR_CATEGORIES:
         return message[:160]
-    text = _CAUSE_SUFFIX_RE.sub("", str(exc))
-    return (text or message)[:160] or type(exc).__name__
+    text = _CAUSE_SUFFIX_RE.sub("", str(exc)).strip() or message
+    if text and isinstance(exc, errors.RPCError):
+        text = f"{error_code(exc)}: {text}"
+    return text[:160] or type(exc).__name__
 
 
 # What the owner reads in the bot panel and in job notes instead of a bare Telegram error code.
@@ -577,11 +591,12 @@ class Transport:
         dc = await client._get_dc(client.session.dc_id)
         # No automatic reconnection: a lane that breaks is dropped (its parts go over the main connection); two
         # dozen senders redialling at once is what turns a hiccup into a flood.
-        sender = MTProtoSender(client.session.auth_key, loggers=client._log, auto_reconnect=False, retries=1)
+        loggers = _LaneLoggers()
+        sender = MTProtoSender(client.session.auth_key, loggers=loggers, auto_reconnect=False, retries=1)
         try:
             await sender.connect(
                 client._connection(
-                    dc.ip_address, dc.port, dc.id, loggers=client._log, proxy=client._proxy, local_addr=client._local_addr
+                    dc.ip_address, dc.port, dc.id, loggers=loggers, proxy=client._proxy, local_addr=client._local_addr
                 )
             )
             init = copy.copy(client._init_request)
@@ -602,6 +617,12 @@ class Transport:
             if self._extra_owner is not client:
                 await self._close_extra_senders()
                 self._extra_owner = client
+            # A connection that the other side closed while it sat idle says nothing about overload (a loss during an
+            # upload does): it is replaced without counting against the pool.
+            for idle in [sender for sender in self._extra_senders if not sender.is_connected()]:
+                self._extra_senders.remove(idle)
+                self._spawn(self._safe_disconnect_sender(idle))
+                LOG.debug("An idle upload connection was closed from outside; opening a new one")
             while len(self._extra_senders) > wanted:  # the pool was halved: let the surplus go
                 surplus = self._extra_senders.pop()
                 self._spawn(self._safe_disconnect_sender(surplus))
@@ -717,8 +738,8 @@ class Transport:
                     if task_is_cancelling():
                         raise
                     self._forget_lane(lanes, lane, "connection lost")
-                except (asyncio.TimeoutError, OSError, errors.RPCError) as exc:
-                    self._forget_lane(lanes, lane, exc or type(exc).__name__)
+                except Exception as exc:  # any failure of an extra connection (a closed stream, a transport flood, ...)
+                    self._forget_lane(lanes, lane, f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
             if ok is None:
                 try:
                     ok = await asyncio.wait_for(client(request), REQUEST_TIMEOUT_SECONDS)

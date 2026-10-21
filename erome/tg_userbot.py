@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from typing import Any, Callable
 
 from telethon import TelegramClient, errors, functions, types, utils
@@ -56,6 +57,10 @@ class DestinationError(RuntimeError):
 class GroupRejected(RuntimeError):
     """Telegram refused the whole album; nothing was posted and the files can still go out one by one."""
 
+    def __init__(self, reason: str, code: str = "") -> None:
+        super().__init__(reason)
+        self.code = code  # the RPC code of the refusal when there was one (MEDIA_EMPTY, ...)
+
 
 DESTINATION_ERRORS = error_classes(
     "ChatWriteForbiddenError", "ChatAdminRequiredError", "UserBannedInChannelError", "ChannelPrivateError",
@@ -78,8 +83,11 @@ TRANSIENT_RPC_ERRORS = error_classes(
     "ServerError", "RpcCallFailError", "RpcMcgetFailError", "InterdcCallErrorError", "InterdcCallRichErrorError",
     "TimedOutError",
 )
-# Trouble with the link, not with the data: the same request can simply be repeated later.
-TRANSIENT_ERRORS = (ConnectionError, asyncio.TimeoutError, DeliveryUncertain, UserbotUnavailable, *TRANSIENT_RPC_ERRORS)
+# Trouble with the link, not with the data: the same request can simply be repeated later (EOFError: a connection that
+# the other side closed in the middle of an answer).
+TRANSIENT_ERRORS = (
+    ConnectionError, EOFError, asyncio.TimeoutError, DeliveryUncertain, UserbotUnavailable, *TRANSIENT_RPC_ERRORS
+)
 
 
 def is_destination_error(exc: BaseException) -> bool:
@@ -90,6 +98,13 @@ def is_file_error(exc: BaseException) -> bool:
     """A refusal about the media itself (rejected media or picture), not about the chat, the account or the link."""
     code = error_code(exc)
     return code.startswith(("MEDIA_", "PHOTO_")) or code == "IMAGE_PROCESS_FAILED"
+
+
+def describe_unit(unit: list[SendItem]) -> str:
+    """What an album is made of, for the log: «6 photo, 2 video, 1 without sound»."""
+    parts = [f"{count} {kind}" for kind, count in Counter(item.kind for item in unit).items()]
+    silent = sum(1 for item in unit if item.silent)
+    return ", ".join(parts + ([f"{silent} without sound"] if silent else []))
 
 
 class Refusal(str):
@@ -107,6 +122,10 @@ class Refusal(str):
 class Userbot(Transport):
     """The transport plus the sending side: uploads, albums, single messages, the rules of what counts as delivered."""
 
+    # A video without sound is told to Telegram (`nosound_video`), otherwise Telegram takes it for a GIF and refuses the
+    # whole album (MEDIA_EMPTY). Should it refuse such an album anyway, silent videos stop going into albums.
+    silent_in_albums = True
+
     @property
     def max_upload_bytes(self) -> int:
         return PREMIUM_UPLOAD_LIMIT_BYTES if self.premium else FREE_UPLOAD_LIMIT_BYTES
@@ -115,13 +134,15 @@ class Userbot(Transport):
     def _reply_to(self) -> Any:
         return types.InputReplyToMessage(reply_to_msg_id=int(self.thread_id)) if self.thread_id else None
 
-    @staticmethod
-    def _units(items: list[SendItem]) -> list[list[SendItem]]:
+    def _groupable(self, item: SendItem) -> bool:
+        return item.kind == "photo" or (item.kind == "video" and (self.silent_in_albums or not item.silent))
+
+    def _units(self, items: list[SendItem]) -> list[list[SendItem]]:
         """Consecutive photos/videos form albums of up to 10; anything else is a message of its own."""
         units: list[list[SendItem]] = []
         album: list[SendItem] = []
         for item in items:
-            if item.kind in ("photo", "video"):
+            if self._groupable(item):
                 album.append(item)
                 if len(album) == ALBUM_MAX_ITEMS:
                     units.append(album)
@@ -260,6 +281,7 @@ class Userbot(Transport):
             attributes=attributes,
             thumb=item.thumb_file,
             force_file=True if item.kind == "file" and not animated else None,
+            nosound_video=True if item.kind == "video" else None,  # no effect on a video that has sound
         )
 
     async def _send_unit(
@@ -275,7 +297,12 @@ class Userbot(Transport):
             try:
                 await self._send_album(unit, caption)
             except GroupRejected as exc:
-                LOG.info("Telegram refused the album (%s); sending its %d files one by one", exc, len(unit))
+                LOG.info(
+                    "Telegram refused the album (%s; %s); sending its %d files one by one", exc, describe_unit(unit), len(unit)
+                )
+                if self.silent_in_albums and exc.code.startswith("MEDIA_") and any(item.silent for item in unit):
+                    self.silent_in_albums = False
+                    LOG.warning("An album with a video without sound was refused: such videos go out alone from now on")
             else:
                 on_delivered(list(unit))
                 return refused, True
@@ -340,7 +367,7 @@ class Userbot(Transport):
                     raise DestinationError(human_error(exc)) from exc
                 if item.kind == "photo" and isinstance(exc, PHOTO_ERRORS):
                     item.kind = "file"  # a document cannot join an album: the files go out one by one
-                raise GroupRejected(describe_error(exc)) from exc
+                raise GroupRejected(describe_error(exc), error_code(exc)) from exc
             media = getattr(registered, "photo", None) or getattr(registered, "document", None)
             if media is None:
                 raise GroupRejected("Telegram did not return the uploaded media")
@@ -367,7 +394,7 @@ class Userbot(Transport):
         except errors.RPCError as exc:
             if is_destination_error(exc):
                 raise DestinationError(human_error(exc)) from exc
-            raise GroupRejected(describe_error(exc)) from exc
+            raise GroupRejected(describe_error(exc), error_code(exc)) from exc
         except (asyncio.CancelledError, UserbotUnavailable, RetryLater):
             raise
         except Exception as exc:
