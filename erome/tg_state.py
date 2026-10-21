@@ -146,8 +146,15 @@ class TelegramState:
         return next((job for job in self.queue if job.url == url), None)
 
     def next_queued(self) -> Job | None:
+        """The job to start next. A profile goes first: reading it only adds albums (right behind it, so their order in
+        the queue stays that of the links), and the owner learns at once whether the profile can be read at all."""
         now = time.time()
-        return next((job for job in self.queue if job.status == QUEUED and job.not_before <= now), None)
+        ready = [job for job in self.queue if job.status == QUEUED and job.not_before <= now]
+        return next((job for job in ready if job.kind == LinkKind.ACCOUNT), ready[0] if ready else None)
+
+    def jobs_before(self, job: Job) -> list[Job]:
+        """The jobs in front of `job` in the queue, the one being processed included."""
+        return self.queue[: self.queue.index(job)] if job in self.queue else list(self.queue)
 
     def queued(self) -> list[Job]:
         return [job for job in self.queue if job.status == QUEUED]

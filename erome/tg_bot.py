@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
@@ -30,11 +31,11 @@ from erome.console import RunControl, log, log_warn
 from erome.models import LinkKind
 from erome.tg_pipeline import Pipeline, Progress
 from erome.tg_settings import TelegramSettings
-from erome.tg_state import CANCELLED, DONE, FAILED, PARTIAL, Job, TelegramState
+from erome.tg_state import CANCELLED, DONE, FAILED, PARTIAL, QUEUED, RUNNING, Job, TelegramState
 from erome.tg_transport import STATE_READY
 from erome.tg_userbot import Userbot
 from erome.ui import human_duration, human_size, plural
-from erome.urls import link_kind, normalize_download_url
+from erome.urls import account_name_from_url, link_kind, normalize_download_url
 
 LOG = logging.getLogger("erome.tg")
 
@@ -46,6 +47,9 @@ CONFIRM_SECONDS = 6
 QUEUE_LINES = 5
 RECENT_LINES = 5
 PANEL_LIMIT = 3900
+ANSWER_MERGE_SECONDS = 8.0  # links that follow an answer this closely are added to that same message
+ANSWER_KEEP_SECONDS = 600.0  # an answer stays this long (or until the next one comes) and is then removed
+ANSWER_MAX_LINES = 12
 
 _LINK_RE = re.compile(r"(?<![\w.@/-])(?:https?://)?(?:www\.)?erome\.com/[^\s<>\"']+", re.IGNORECASE)
 _TRAILING = ").,;:!?]}>\"'"
@@ -54,8 +58,10 @@ HELP = (
     "Пришлите ссылку на <b>альбом</b> (erome.com/a/…) или на <b>профиль</b> (erome.com/имя) — "
     "можно сразу несколько: через пробел, с новой строки или отдельными сообщениями. "
     "Всё скачается и уйдёт в группу по очереди.\n"
-    "Профиль: добавлю его альбомы, которых ещё не отправляли, от старых к новым. "
-    "Повторная ссылка на альбом ничего не продублирует — отправится только недостающее.\n"
+    "Присылать можно в любой момент, даже пока что-то качается: ссылка встанет в очередь, а я сразу отвечу, "
+    "что добавлено и что идёт сейчас.\n"
+    "Профиль: прочитаю его сразу после текущего альбома и добавлю альбомы, которых ещё не отправляли, "
+    "от старых к новым. Повторная ссылка на альбом ничего не продублирует — отправится только недостающее.\n"
     "Выложить альбом заново: <code>/resend ссылка</code>."
 )
 
@@ -108,7 +114,7 @@ def link(title: str, url: str, limit: int = 60) -> str:
 
 def job_label(job: Job) -> str:
     if job.kind == LinkKind.ACCOUNT:
-        return link(job.title or "Профиль", job.url)
+        return link(job.title or f"Профиль {account_name_from_url(job.url)}", job.url)
     return link(job.title or job.url.replace("https://", ""), job.url)
 
 
@@ -118,6 +124,27 @@ def count_text(count: int, one: str, few: str, many: str) -> str:
 
 def view_signature(text: str, markup: InlineKeyboardMarkup) -> tuple:
     return text, tuple(button.text for row in markup.inline_keyboard for button in row)
+
+
+@dataclass
+class Submitted:
+    """What became of a link the owner sent: put in the queue now, or already there (or running)."""
+
+    kind: LinkKind
+    url: str
+    job: Job
+    added: bool
+    repeat: bool = False  # sent by /resend
+
+
+@dataclass
+class Answer:
+    """The bot's latest reply to the owner's links in a chat: kept to merge a burst into one message and to clean up."""
+
+    message_id: int
+    changed: float
+    lines: list[str]
+    status: bool
 
 
 # ----- the application --------------------------------------------------------------------------------
@@ -145,6 +172,8 @@ class BotApp:
         self._locks: dict[int, asyncio.Lock] = {}
         self._last_view: dict[int, tuple] = {}  # what each panel shows now: (text, button labels)
         self._last_edit: dict[int, float] = {}
+        self._answers: dict[int, Answer] = {}
+        self._answer_locks: dict[int, asyncio.Lock] = {}
         self._denied_logged: set[int] = set()
 
     # ----- text of the panel ------------------------------------------------------------------------
@@ -180,11 +209,8 @@ class BotApp:
             parts.append(f"осталось ≈ {human_duration(eta)}")
         return " · ".join(parts)
 
-    def render(self) -> tuple[str, InlineKeyboardMarkup]:
-        now = time.monotonic()
-        lines = ["<b>Erome → Telegram</b>"]
-        if self.notice and now < self.notice_until:
-            lines += ["", self.notice]
+    def warning_lines(self) -> list[str]:
+        """Why nothing may be moving right now (shown in the panel and at the end of an answer)."""
         warnings = []
         if self.userbot.state != STATE_READY:
             warnings.append(f"⚠ Telegram: {esc(self.userbot.panel_status())}")
@@ -194,6 +220,14 @@ class BotApp:
             warnings.append(f"⏳ {esc(self.pipeline.waiting)}")
         if self.paused:
             warnings.append("⏸ Пауза: текущая пачка файлов дойдёт до конца, дальше ничего не начнётся")
+        return warnings
+
+    def render(self) -> tuple[str, InlineKeyboardMarkup]:
+        now = time.monotonic()
+        lines = ["<b>Erome → Telegram</b>"]
+        if self.notice and now < self.notice_until:
+            lines += ["", self.notice]
+        warnings = self.warning_lines()
         if warnings:
             lines += [""] + warnings
 
@@ -289,6 +323,7 @@ class BotApp:
         while True:
             await asyncio.sleep(1.0)
             try:
+                await self.expire_answers()
                 for chat_id_text in list(self.state.panels):
                     await self._refresh_panel(int(chat_id_text))
             except asyncio.CancelledError:
@@ -308,6 +343,121 @@ class BotApp:
         async with self._lock(chat_id):
             if not await self._edit(chat_id, message_id, text, markup):
                 self.state.set_panel(chat_id, None)  # deleted by the user: back on their next message
+
+    # ----- answers to the owner's links -------------------------------------------------------------------
+
+    def standing(self, job: Job) -> str:
+        """Where a job stands, in words: running now, or its place in the queue."""
+        if job.status == RUNNING:
+            return "в работе прямо сейчас"
+        before = self.state.jobs_before(job)
+        if job.kind == LinkKind.ACCOUNT:
+            when = "после «Продолжить»" if self.paused else "сразу после текущего" if before else "сразу"
+            return f"в очереди (прочитаю {when})"
+        text = f"в очереди №{1 + sum(1 for other in before if other.status == QUEUED)}"
+        profiles = sum(1 for other in before if other.kind == LinkKind.ACCOUNT)
+        if profiles:
+            text += (
+                f" (впереди {count_text(profiles, 'профиль', 'профиля', 'профилей')}: "
+                f"{'его' if profiles == 1 else 'их'} альбомы встанут раньше)"
+            )
+        return text
+
+    def submitted_line(self, item: Submitted) -> str:
+        """One line of the answer about a link: added (and where), or why nothing was added."""
+        label, where = job_label(item.job), self.standing(item.job)
+        if not item.added:
+            return f"↩ {label} — уже {where}"
+        line = f"{'🔁' if item.repeat else '➕'} {label} — {where}"
+        if item.kind == LinkKind.ALBUM and not item.repeat and self.state.is_album_done(item.url):
+            line += ". Отправлялся раньше: проверю, всё ли дошло"
+        return line
+
+    def situation_lines(self) -> list[str]:
+        """What is going on right now, for the end of an answer."""
+        lines = self.warning_lines()
+        progress = self.pipeline.progress
+        if progress is not None:
+            lines.append(f"<b>Сейчас:</b> {job_label(progress.job)} — {esc(self.activity_line(progress))}")
+        elif not self.paused and self.state.queued():
+            if self.state.next_queued() is not None:
+                lines.append("Сейчас ничего не скачивается, начинаю сразу.")
+            else:
+                lines.append("Жду повторной попытки: сайт не ответил.")
+        lines.append(f"В очереди: {len(self.state.queued())}")
+        return lines
+
+    def answer_text(self, body: list[str], status: bool) -> str:
+        shown = body
+        if len(body) > ANSWER_MAX_LINES:
+            shown = body[: ANSWER_MAX_LINES - 1] + [f"… и ещё {len(body) - ANSWER_MAX_LINES + 1}"]
+        parts = ["\n".join(shown)]
+        if status:
+            parts.append("\n".join(self.situation_lines()))
+        return "\n\n".join(parts)
+
+    def _answer_lock(self, chat_id: int) -> asyncio.Lock:
+        return self._answer_locks.setdefault(chat_id, asyncio.Lock())
+
+    async def answer(self, chat_id: int, lines: list[str], *, status: bool = True) -> None:
+        """Reply to the owner at once, in a message of its own: what became of the links and what is going on now.
+
+        Links that arrive in a burst share one message (it is edited); a later answer replaces the earlier one, and an
+        old answer is removed after a while, so the chat does not fill up. If the reply cannot be sent, the same
+        text goes to the panel's notice line.
+        """
+        if not lines:
+            return
+        try:
+            async with self._answer_lock(chat_id):
+                await self._answer(chat_id, lines, status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # the links are queued already: a reply that failed must not hide that
+            LOG.warning("Could not answer the owner: %s: %s", type(exc).__name__, exc)
+            self.set_notice("\n".join(lines))
+
+    async def _answer(self, chat_id: int, lines: list[str], status: bool) -> None:
+        now = time.monotonic()
+        previous = self._answers.get(chat_id)
+        if previous is not None and now - previous.changed <= ANSWER_MERGE_SECONDS:
+            merged = previous.lines + lines
+            status = status or previous.status
+            if await self._edit_answer(chat_id, previous.message_id, self.answer_text(merged, status)):
+                self._answers[chat_id] = Answer(previous.message_id, now, merged, status)
+                return
+        elif previous is not None:
+            await self._remove_answer(chat_id, previous.message_id)
+        self._answers.pop(chat_id, None)  # nothing to add to: this answer starts a message of its own
+        sent = await self.bot.send_message(chat_id, self.answer_text(lines, status))
+        self._answers[chat_id] = Answer(sent.message_id, now, list(lines), status)
+
+    async def _edit_answer(self, chat_id: int, message_id: int, text: str) -> bool:
+        """Edit an earlier answer; False when it is gone."""
+        try:
+            await self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+        except TelegramBadRequest as exc:
+            reason = str(exc).lower()
+            if "message is not modified" in reason:
+                return True
+            if "not found" in reason or "can't be edited" in reason or "message to edit" in reason:
+                return False
+            raise
+        return True
+
+    async def _remove_answer(self, chat_id: int, message_id: int) -> None:
+        with contextlib.suppress(TelegramAPIError):
+            await self.bot.delete_message(chat_id, message_id)
+
+    async def expire_answers(self) -> None:
+        now = time.monotonic()
+        for chat_id, answer in list(self._answers.items()):
+            if now - answer.changed <= ANSWER_KEEP_SECONDS:
+                continue
+            async with self._answer_lock(chat_id):
+                if self._answers.get(chat_id) is answer:  # not replaced while the lock was awaited
+                    del self._answers[chat_id]
+                    await self._remove_answer(chat_id, answer.message_id)
 
     # ----- console line -------------------------------------------------------------------------------
 
@@ -356,28 +506,22 @@ def build_router(app: BotApp) -> Router:
         with contextlib.suppress(TelegramAPIError):
             await message.delete()
 
-    def enqueue(links: list[tuple[LinkKind, str]]) -> tuple[int, int, int]:
-        """(albums added, profiles added, already queued) - the queue is saved to disk before this returns."""
-        albums = profiles = duplicates = 0
+    def enqueue(links: list[tuple[LinkKind, str]], *, repeat: bool = False) -> list[Submitted]:
+        """Put the links in the queue (it is saved to disk before this returns); tells what became of each one."""
+        results: list[Submitted] = []
         for kind, url in links:
-            if app.pipeline.submit(kind, url) is None:
-                duplicates += 1
-            elif kind == LinkKind.ACCOUNT:
-                profiles += 1
-            else:
-                albums += 1
-        return albums, profiles, duplicates
+            job = app.pipeline.submit(kind, url)
+            if job is not None:
+                results.append(Submitted(kind, url, job, True, repeat))
+            elif (known := app.state.find_open(url)) is not None:
+                results.append(Submitted(kind, url, known, False, repeat))
+        return results
 
-    def describe_added(albums: int, profiles: int, duplicates: int) -> str:
-        parts = []
-        if albums:
-            parts.append(count_text(albums, "альбом", "альбома", "альбомов"))
-        if profiles:
-            parts.append(count_text(profiles, "профиль", "профиля", "профилей"))
-        text = ("➕ Добавлено: " + ", ".join(parts)) if parts else "Ничего нового не добавлено"
-        if duplicates:
-            text += f". Уже в очереди: {duplicates}"
-        return text + "."
+    def log_added(items: list[Submitted]) -> None:
+        albums = sum(1 for item in items if item.added and item.kind == LinkKind.ALBUM)
+        profiles = sum(1 for item in items if item.added and item.kind == LinkKind.ACCOUNT)
+        if albums or profiles:
+            log(f"Новые ссылки: альбомов {albums}, профилей {profiles}; в очереди {len(app.state.queued())}")
 
     @router.message(CommandStart())
     async def on_start(message: Message) -> None:
@@ -394,35 +538,39 @@ def build_router(app: BotApp) -> Router:
     async def on_resend(message: Message) -> None:
         links = [item for item in extract_links(message) if item[0] == LinkKind.ALBUM]
         if not links:
-            app.set_notice("Укажите ссылку на альбом: <code>/resend https://www.erome.com/a/…</code>")
+            reply = app.answer(
+                message.chat.id, ["Укажите ссылку на альбом: <code>/resend https://www.erome.com/a/…</code>"], status=False
+            )
         else:
             # An album that is queued or being sent keeps its record: forgetting it mid-run would post its files twice.
-            busy = [item for item in links if app.state.find_open(item[1]) is not None]
-            fresh = [item for item in links if item not in busy]
+            open_jobs = {url: app.state.find_open(url) for _, url in links}
+            busy = [job for job in open_jobs.values() if job is not None]
+            fresh = [(kind, url) for kind, url in links if open_jobs[url] is None]
             for _, url in fresh:
                 app.state.reset_album(url)
-            albums, _, duplicates = enqueue(fresh)
-            notes = []
+            submitted = enqueue(fresh, repeat=True)
             if fresh:
-                notes.append("🔁 " + describe_added(albums, 0, duplicates))
                 log(f"Повторная отправка: {len(fresh)}")
-            if busy:
-                notes.append(f"Уже в очереди или отправляется: {len(busy)} — дождитесь окончания и повторите.")
-            app.set_notice(" ".join(notes))
-        await tidy(message)
+            lines = [app.submitted_line(item) for item in submitted]
+            lines += [f"↩ {job_label(job)} — уже {app.standing(job)}: дождитесь окончания и повторите" for job in busy]
+            reply = app.answer(message.chat.id, lines)
+        await asyncio.gather(reply, tidy(message))
         await app.show_panel(message.chat.id)
 
     @router.message(F.text | F.caption)
     async def on_text(message: Message) -> None:
         links = extract_links(message)
         if not links:
-            app.set_notice("Не нашёл ссылок на альбом или профиль Erome. Пример: https://www.erome.com/a/AbCd1234")
+            reply = app.answer(
+                message.chat.id,
+                ["Не нашёл ссылок на альбом или профиль Erome. Пример: https://www.erome.com/a/AbCd1234"],
+                status=False,
+            )
         else:
-            albums, profiles, duplicates = enqueue(links)  # already on disk
-            app.set_notice(describe_added(albums, profiles, duplicates))
-            if albums or profiles:
-                log(f"Новые ссылки: альбомов {albums}, профилей {profiles}; в очереди {len(app.state.queued())}")
-        await tidy(message)
+            submitted = enqueue(links)  # on disk before anything is answered
+            log_added(submitted)
+            reply = app.answer(message.chat.id, [app.submitted_line(item) for item in submitted])
+        await asyncio.gather(reply, tidy(message))
         await app.show_panel(message.chat.id)
 
     @router.callback_query(F.data == "tg:pause")

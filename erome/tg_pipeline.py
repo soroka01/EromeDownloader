@@ -1,8 +1,9 @@
 """The job worker of the Telegram mode: read a link, download its files, post them, remember what was posted.
 
-Jobs run one after another. Inside an album the files are cut into batches of up to 10; the next batch is
-downloaded while the current one is being uploaded, and every batch that Telegram accepted is written to the
-ledger before its local files are deleted - so a crash or a restart never loses a file and never posts one twice.
+Jobs run one after another; a profile is read before the albums that wait (it only adds more of them). Inside an
+album the files are cut into batches of up to 10; the next batch is downloaded while the current one is being
+uploaded, and every batch that Telegram accepted is written to the ledger before its local files are deleted - so a
+crash or a restart never loses a file and never posts one twice.
 """
 from __future__ import annotations
 
