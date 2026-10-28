@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![aiohttp](https://img.shields.io/badge/aiohttp-3.14-2C5BB4)
 ![BeautifulSoup](https://img.shields.io/badge/beautifulsoup4-4.15-green)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
 ## 📌 Overview
 
@@ -290,7 +290,7 @@ EromeDownloader/
 
 ## 📄 License
 
-[MIT](LICENSE).
+© 2026 Timofey Soroka. Released under the [GNU General Public License v3.0](LICENSE): you may use, change and redistribute the program freely; modified versions that you distribute must stay under the same license, with their source code available. There is no warranty. Source code: <https://github.com/soroka01/EromeDownloader>.
 
 ## 💬 Support
 
