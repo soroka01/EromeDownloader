@@ -56,6 +56,7 @@ Modes:
 ### Console controls
 
 - Main menu: `1`-`5` are the modes from the table above, `0` (or `q`, `exit`) quits. Empty input selects `1`. The menu is shown again after every action.
+- A mode can be chosen right away, without the menu: `start.bat 5` (or `python main.py 5`). The program runs it once and exits instead of going back to the menu, which suits starting the Telegram bot from a script manager or a scheduler. Exit code: `0` - the mode ran, `1` - it could not start or ended with an error, `2` - unknown parameter.
 - `Ctrl+C` interrupts the current action and returns to the menu; `.part` files and queues are kept, so unfinished work continues on the next run.
 - While running, a single progress line is updated at the bottom: links, albums and files processed, transferred size, speed and time left.
 - Hot keys (interactive console only, also work on a Russian keyboard layout): `S` - status, `P` - pause, `Q` - stop after the current item. Pause and stop take effect between items: queue links and albums, accounts; an album or file already in progress runs to completion. While downloading a single album or file (mode `1`) only `S` works; for an account in mode `1`, pause and stop take effect between its albums. Unprocessed items stay in the queue.

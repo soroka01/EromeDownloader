@@ -148,7 +148,7 @@ def run_scan() -> None:
     )
 
 
-def run_telegram() -> None:
+def run_telegram() -> bool:
     try:
         from erome.tg_mode import run_telegram_bot  # on demand: aiogram and Telethon are needed only here
     except ImportError as exc:
@@ -156,15 +156,18 @@ def run_telegram() -> None:
             f"Для режима 5 не хватает пакета «{exc.name}». Запустите start.bat "
             "или выполните: python -m pip install -r requirements.txt"
         )
-        return
-    run_telegram_bot()
+        return False
+    return run_telegram_bot()
 
 
-def attempt(action: Callable[[], None]) -> None:
-    """Run one menu action; failures and Ctrl+C return to the menu instead of closing the program."""
+def attempt(action: Callable[[], bool | None]) -> bool:
+    """Run one menu action; failures and Ctrl+C return to the menu instead of closing the program.
+
+    True when the action did its job; an action that could not says so by returning False.
+    """
     reset_queue_cache()  # links/*.txt may have been edited by hand while the menu was open
     try:
-        action()
+        return action() is not False
     except KeyboardInterrupt:
         ui.idle()
         log_warn("Прервано (Ctrl+C). Незавершённые загрузки продолжатся при следующем запуске")
@@ -174,9 +177,25 @@ def attempt(action: Callable[[], None]) -> None:
         ui.line(traceback.format_exc().rstrip(), "dim")
     finally:
         flush_manifest()
+    return False
 
 
-def main() -> int:
+def run_chosen(args: list[str], actions: dict[str, Callable[[], bool | None]]) -> int:
+    """The program was started with a menu item (start.bat 5): do it once and leave instead of showing the menu, so
+    whatever started it (a script manager, a scheduler) sees it end. Exit code: 0 done, 1 not done, 2 unknown item."""
+    choice = args[0].lower()
+    if choice in EXIT_KEYS:
+        return 0
+    if choice not in actions:
+        ui.line(f"  Неизвестный параметр «{args[0]}». Укажите номер пункта меню, например: start.bat 5", "warn")
+        return 2
+    if len(args) > 1:
+        ui.line(f"  Лишние параметры игнорируются: {' '.join(args[1:])}", "warn")
+    return 0 if attempt(actions[choice]) else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
     configure_console()
     ui.set_title("EromeDownloader")
     ensure_runtime_dirs()
@@ -188,6 +207,8 @@ def main() -> int:
         "5": run_telegram,
     }
     show_banner()
+    if args:
+        return run_chosen(args, actions)
     show_menu()
     while True:
         try:

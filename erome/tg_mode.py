@@ -318,7 +318,11 @@ async def _run(settings: TelegramSettings) -> None:
 def _ask_token() -> bool:
     ui.line("Нужен токен Telegram-бота: создайте бота у @BotFather (команда /newbot) и вставьте токен сюда.")
     ui.line("Он сохранится в telegram.json (этот файл не попадает в git).", "dim")
-    token = ui.ask("Токен бота (пусто — отмена)")
+    try:
+        token = ui.ask("Токен бота (пусто — отмена)")
+    except EOFError:  # started without a console (a script manager, a scheduler): there is nobody to type it
+        log_error(f"Ввести токен некому: впишите bot_token в {SETTINGS_PATH.name} и запустите режим снова.")
+        return False
     if not token:
         return False
     if not valid_bot_token(token):
@@ -328,30 +332,33 @@ def _ask_token() -> bool:
     return True
 
 
-def run_telegram_bot() -> None:
-    """Menu entry: prepare settings and the userbot sign-in in the console, then run until stopped."""
+def run_telegram_bot() -> bool:
+    """Menu entry: prepare settings and the userbot sign-in in the console, then run until stopped.
+
+    False when the mode could not start or ended on a settings error; True after an ordinary stop.
+    """
     lock = InstanceLock(DATA_DIR / "telegram.lock")
     if not lock.acquire():
         log_error("Telegram-режим уже запущен в другом окне: закройте его или дождитесь остановки.")
-        return
+        return False
     try:
         configure_logging()
         try:
             if ensure_settings_file():
                 log_warn(f"Создан файл {SETTINGS_PATH.name}: впишите в него chat_id, thread_id, owner_ids и учётные данные.")
             if not bot_token_is_set(read_raw()) and not _ask_token():
-                return
+                return False
             settings = load_settings()
         except SettingsError as exc:
             log_error(str(exc))
             if SETTINGS_PATH.exists():
                 log(f"Файл настроек: {SETTINGS_PATH}", "dim")
-            return
+            return False
         ui.idle()
         signed_in, info = sign_in_if_needed(settings, say=ui.line)
         if not signed_in:
             log_error(f"Отправка невозможна: {info}")
-            return
+            return False
         log_success(f"Аккаунт для отправки: {info}")
         if settings.account_id is None:
             log_warn("В telegram.json не указан account_id: проверки аккаунта нет")
@@ -360,8 +367,9 @@ def run_telegram_bot() -> None:
                 asyncio.run(_run(settings))
         except SettingsError as exc:
             log_error(str(exc))
-        else:
-            log_success("Telegram-режим остановлен. Очередь сохранена — продолжится при следующем запуске.")
+            return False
+        log_success("Telegram-режим остановлен. Очередь сохранена — продолжится при следующем запуске.")
+        return True
     finally:
         ui.idle()
         lock.release()
