@@ -1,33 +1,33 @@
 # 📥 EromeDownloader
 
-> Консольный загрузчик публичных альбомов, медиафайлов и аккаунтов Erome.
+> Command-line downloader for public Erome albums, media files and accounts.
 
-🌐 **Язык / Language:** [Русский](README.md) · [English](README_EN.md)
+🌐 **Language / Язык:** [English](README.md) · [Русский](README_RU.md)
 
 ![Python](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![aiohttp](https://img.shields.io/badge/aiohttp-3.14-2C5BB4)
 ![BeautifulSoup](https://img.shields.io/badge/beautifulsoup4-4.15-green)
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
-## 📌 Обзор
+## 📌 Overview
 
-Программа скачивает публичные альбомы, отдельные файлы и новые альбомы аккаунтов Erome. Поддерживает очереди, параллельную загрузку, докачку и отслеживание аккаунтов. Интерфейс консольный: после запуска показывается главное меню, режим выбирается номером. Отдельный режим — Telegram-бот: присылаете ему ссылки на альбомы и профили, а он скачивает их и выкладывает в вашу группу.
+The program downloads public Erome albums, individual files and new albums from accounts. It supports queues, parallel downloads, resuming and account tracking. The interface is a console menu: after launch the main menu is shown and you pick a mode by number. One mode is a Telegram bot: you send it links to albums and profiles, and it downloads them and posts them to your group.
 
 > [!NOTE]
-> Авторизация Erome, cookies и private albums не поддерживаются.
+> Erome authentication, cookies and private albums are not supported.
 
-## ✨ Возможности
+## ✨ Features
 
-- Пять режимов: одна ссылка, очередь, проверка аккаунтов, только поиск новых альбомов, Telegram-бот
-- Telegram-бот: ссылки на альбомы и профили из чата → скачивание → отправка в группу или тему от вашего аккаунта; можно присылать много ссылок подряд, не дожидаясь окончания предыдущих
-- Параллельная загрузка нескольких альбомов и файлов
-- Докачка через `.part`-файлы и HTTP Range
-- Отслеживание новых альбомов аккаунтов (`links/accs.txt`)
-- Статус-файлы очереди и JSON manifest
-- Опциональная сортировка альбомов по размеру и фильтры `skip_videos` / `skip_images`
-- Импорт ссылок из браузерных закладок (`extract_links.py`)
+- Five modes: single link, queue, account check, scan-only for new albums, Telegram bot
+- Telegram bot: album and profile links from a chat → download → posting to a group or topic from your own account; send as many links as you like without waiting for the previous ones
+- Parallel downloading of multiple albums and files
+- Resuming via `.part` files and HTTP Range
+- Tracking new account albums (`links/accs.txt`)
+- Queue status files and a JSON manifest
+- Optional sorting of albums by size and `skip_videos` / `skip_images` filters
+- Importing links from browser bookmarks (`extract_links.py`)
 
-## 🏗️ Как это работает
+## 🏗️ How it works
 
 ```mermaid
 flowchart TD
@@ -36,43 +36,43 @@ flowchart TD
     C --> D["Statuses + JSON manifest"]
 ```
 
-Режимы:
+Modes:
 
-| Режим | Источник | Поведение |
+| Mode | Source | Behavior |
 | --- | --- | --- |
-| `1` | URL из консоли | Скачивает один direct URL, альбом или все новые альбомы аккаунта |
-| `2` | `links/pending.txt` | Обрабатывает очередь, повторяет failures и обновляет status-файлы |
-| `3` | `links/accs.txt` | Проверяет отслеживаемые аккаунты и скачивает новые альбомы |
-| `4` | `links/accs.txt` | Только находит новые альбомы и добавляет их в `pending.txt` |
-| `5` | Чат с Telegram-ботом | Принимает ссылки, скачивает и отправляет в группу, см. [раздел ниже](#-telegram-бот-режим-5) |
+| `1` | Console URL | Downloads one direct URL, one album, or all new albums of an account |
+| `2` | `links/pending.txt` | Processes the queue, retries failures and updates status files |
+| `3` | `links/accs.txt` | Checks tracked accounts and downloads new albums |
+| `4` | `links/accs.txt` | Only finds new albums and appends them to `pending.txt` |
+| `5` | Telegram bot chat | Takes links, downloads and posts them to a group, see [the section below](#-telegram-bot-mode-5) |
 
-- Режим `1` для одного альбома или файла пишет только manifest. Если ввести аккаунт, он ведёт себя как очередь: статусы его альбомов попадают в `ready.txt`, `failed.txt` и `banned.txt`, а сам аккаунт — в manifest.
-- Режим `3` всегда собирает и изображения, и видео: `skip_images` и `skip_videos` к нему не применяются.
-- Режим `4` считает известными URL из `ready`, `banned`, `failed` и `pending`, поэтому failed URL автоматически в очередь не возвращается.
-- Ссылки на альбомы понимаются в любом виде (`http://`, без `www`, без `https://`, с `?…` на конце) и хранятся в одном: `https://www.erome.com/a/<id>`.
-- Если страницы аккаунта прочитаны не все (сайт ответил ошибкой или временно закрыл доступ), аккаунт считается проваленным — частичный список не выдаётся за полный. В режимах `3` и `4` он проверится заново при следующем запуске, в режиме `2` перейдёт из `pending.txt` в `failed_accs.txt` (верните его в `pending.txt` вручную).
-- Сбой на одной ссылке или в одном альбоме (например, недопустимое имя папки) не останавливает остальные: он помечается `failed` и пишется в консоль.
+- For a single album or file, mode `1` writes only the manifest. Given an account, it behaves like a queue: the statuses of the account's albums go to `ready.txt`, `failed.txt` and `banned.txt`, and the account itself goes to the manifest.
+- Mode `3` always collects both images and videos: `skip_images` and `skip_videos` are not applied to it.
+- Mode `4` treats URLs from `ready`, `banned`, `failed` and `pending` as known, so a failed URL is not re-queued automatically.
+- Album links are understood in any form (`http://`, without `www`, without `https://`, with a trailing `?…`) and stored in one: `https://www.erome.com/a/<id>`.
+- If not all pages of an account could be read (the site answered with an error or temporarily shut the door), the account counts as failed - a partial list is never passed off as a complete one. In modes `3` and `4` it is checked again on the next run; in mode `2` it moves from `pending.txt` to `failed_accs.txt` (put it back into `pending.txt` by hand).
+- A failure of one link or album (for example an invalid folder name) does not stop the others: it is marked `failed` and reported in the console.
 
-### Управление в консоли
+### Console controls
 
-- Главное меню: `1`–`5` — режимы из таблицы выше, `0` (или `q`, `exit`) — выход. Пустой ввод выбирает `1`. После каждого действия меню показывается снова.
-- Режим можно выбрать сразу, без меню: `start.bat 5` (или `python main.py 5`). Программа выполнит его один раз и закроется, а не вернётся в меню, — так удобно запускать Telegram-бота из менеджера скриптов или планировщика. Код выхода: `0` — режим отработал, `1` — не смог запуститься или завершился ошибкой, `2` — неизвестный параметр.
-- `Ctrl+C` прерывает текущее действие и возвращает в меню; `.part`-файлы и очереди сохраняются, незавершённое продолжится при следующем запуске.
-- Во время работы внизу обновляется одна строка прогресса: сколько ссылок, альбомов и файлов обработано, объём, скорость и оставшееся время.
-- Горячие клавиши (только в интерактивной консоли, работают и в русской раскладке): `S` — статус, `P` — пауза, `Q` — остановиться после текущего элемента. Пауза и остановка действуют между элементами: ссылками и альбомами очереди, аккаунтами; уже начатый альбом или файл дойдёт до конца. При скачивании одного альбома или файла (режим `1`) работает только `S`; для аккаунта в режиме `1` пауза и остановка действуют между его альбомами. Необработанное остаётся в очереди.
-- Файлы `links/*.txt` можно править руками, пока открыто меню: они перечитываются перед каждым действием.
+- Main menu: `1`-`5` are the modes from the table above, `0` (or `q`, `exit`) quits. Empty input selects `1`. The menu is shown again after every action.
+- A mode can be chosen right away, without the menu: `start.bat 5` (or `python main.py 5`). The program runs it once and exits instead of going back to the menu, which suits starting the Telegram bot from a script manager or a scheduler. Exit code: `0` - the mode ran, `1` - it could not start or ended with an error, `2` - unknown parameter.
+- `Ctrl+C` interrupts the current action and returns to the menu; `.part` files and queues are kept, so unfinished work continues on the next run.
+- While running, a single progress line is updated at the bottom: links, albums and files processed, transferred size, speed and time left.
+- Hot keys (interactive console only, also work on a Russian keyboard layout): `S` - status, `P` - pause, `Q` - stop after the current item. Pause and stop take effect between items: queue links and albums, accounts; an album or file already in progress runs to completion. While downloading a single album or file (mode `1`) only `S` works; for an account in mode `1`, pause and stop take effect between its albums. Unprocessed items stay in the queue.
+- The `links/*.txt` files may be edited by hand while the menu is open: they are re-read before every action.
 
-## 🚀 Быстрый старт
+## 🚀 Quick start
 
-### Требования
+### Requirements
 
 - Python 3.14+
-- Доступ в интернет
-- Зависимости из `requirements.txt`
+- Internet access
+- Dependencies from `requirements.txt`
 
-### Установка
+### Installation
 
-Windows: [start.bat](start.bat) сам создаёт `.venv` и ставит зависимости (`pip install -r requirements.txt` выполняется при каждом запуске, подходящие версии повторно не скачиваются). Вручную:
+Windows: [start.bat](start.bat) creates `.venv` and installs dependencies itself (`pip install -r requirements.txt` runs on every launch; compatible versions are not downloaded again). Manually:
 
 ```powershell
 python -m venv .venv
@@ -86,11 +86,11 @@ python3 -m venv .venv
 ./.venv/bin/python -m pip install -r requirements.txt
 ```
 
-### Конфигурация
+### Configuration
 
-Отдельной настройки не требуется: если `config.json` нет, он создаётся со значениями по умолчанию, а недостающие ключи добавляются встроенными значениями. Подробнее в следующем разделе.
+No setup is required: if `config.json` is missing it is created with defaults, and missing keys fall back to built-in values. See the next section.
 
-### Запуск
+### Run
 
 ```powershell
 .\start.bat
@@ -100,11 +100,11 @@ python3 -m venv .venv
 ./.venv/bin/python main.py
 ```
 
-Папки `downloads/` и `links/` создаются автоматически.
+The `downloads/` and `links/` directories are created automatically.
 
-## ⚙️ Конфигурация
+## ⚙️ Configuration
 
-`config.json` (значения по умолчанию):
+`config.json` (defaults):
 
 ```json
 {
@@ -129,172 +129,172 @@ python3 -m venv .venv
 }
 ```
 
-| Переменная | По умолчанию | Допустимо | Описание |
+| Variable | Default | Allowed | Description |
 | --- | --- | --- | --- |
-| `max_connections` | `6` | 1–256 | Общий целевой лимит соединений загрузки |
-| `min_connections_per_parallel_album` | `3` | 1–256 | Минимум соединений на параллельный альбом |
-| `max_parallel_albums` | `3` | 1–256 | Максимум одновременно обрабатываемых альбомов |
-| `auto_sort_links` | `true` | true / false | Сортировать очередь перед обработкой |
-| `album_prefetch_connections` | `6` | 1–256 | Лимит параллельного чтения страниц альбомов |
-| `account_page_connections` | `3` | 1–256 | Лимит запросов страниц аккаунта |
-| `account_max_pages` | `500` | 1–100000 | Лимит страниц одного аккаунта |
-| `sort_albums_by_size` | `true` | true / false | Оценивать размер и сортировать альбомы |
-| `album_size_probe_connections` | `3` | 1–256 | Параллельные проверки размера |
-| `album_size_probe_timeout` | `20` | 1–86400 | Тайм-аут проверки размера, секунды |
-| `chunk_size_mb` | `1` | 1–1024 | Размер записываемого chunk, МБ |
-| `max_attempts` | `4` | 1–100 | Попытки скачивания файла |
-| `page_attempts` | `3` | 1–100 | Попытки чтения HTML-страницы |
-| `connect_timeout` | `30` | 1–86400 | Тайм-аут соединения, секунды |
-| `idle_timeout` | `180` | 1–86400 | Допустимое время без новых данных, секунды |
-| `skip_videos` | `false` | true / false | Не включать видео там, где режим учитывает фильтр |
-| `skip_images` | `false` | true / false | Не включать изображения там, где режим учитывает фильтр |
-| `manifest_path` | `links/manifest.json` | путь | Путь к JSON manifest: относительно проекта или абсолютный |
+| `max_connections` | `6` | 1-256 | Overall target limit of download connections |
+| `min_connections_per_parallel_album` | `3` | 1-256 | Minimum connections per parallel album |
+| `max_parallel_albums` | `3` | 1-256 | Maximum albums processed at once |
+| `auto_sort_links` | `true` | true / false | Sort the queue before processing |
+| `album_prefetch_connections` | `6` | 1-256 | Limit of parallel album page reads |
+| `account_page_connections` | `3` | 1-256 | Limit of account page requests |
+| `account_max_pages` | `500` | 1-100000 | Page limit per account |
+| `sort_albums_by_size` | `true` | true / false | Estimate size and sort albums |
+| `album_size_probe_connections` | `3` | 1-256 | Parallel size probes |
+| `album_size_probe_timeout` | `20` | 1-86400 | Size probe timeout, seconds |
+| `chunk_size_mb` | `1` | 1-1024 | Size of a written chunk, MB |
+| `max_attempts` | `4` | 1-100 | File download attempts |
+| `page_attempts` | `3` | 1-100 | HTML page read attempts |
+| `connect_timeout` | `30` | 1-86400 | Connection timeout, seconds |
+| `idle_timeout` | `180` | 1-86400 | Allowed time without new data, seconds |
+| `skip_videos` | `false` | true / false | Skip videos in modes that honor the filter |
+| `skip_images` | `false` | true / false | Skip images in modes that honor the filter |
+| `manifest_path` | `links/manifest.json` | path | JSON manifest path: project-relative or absolute |
 
-При запуске значения проверяются, о каждой правке пишется предупреждение в консоли: число вне диапазона заменяется ближайшим допустимым (`300` → `256`), а не число или не `true`/`false` — значением по умолчанию. Неизвестный ключ (например, опечатка) игнорируется, тоже с предупреждением.
+Values are checked at startup and every correction is reported as a warning in the console: a number out of range is replaced by the nearest allowed one (`300` → `256`), and something that is not a number, or not `true`/`false`, by its default. An unknown key (a typo, say) is ignored, also with a warning.
 
-### Очереди и результаты
+### Queues and outputs
 
-| Путь | Назначение |
+| Path | Purpose |
 | --- | --- |
-| `links/pending.txt` | Очередь direct URLs, альбомов и аккаунтов |
-| `links/accs.txt` | Постоянный список отслеживаемых аккаунтов |
-| `links/ready.txt` | Успешно завершённые batch-ссылки |
-| `links/failed.txt` | Ссылки, не скачанные после последней попытки |
-| `links/banned.txt` | Недоступные ссылки, включая HTTP 403/404/410 |
-| `links/ready_accs.txt` | Успешно обработанные аккаунты |
-| `links/failed_accs.txt` | Аккаунты с ошибкой |
-| `links/banned_accs.txt` | Недоступные аккаунты |
-| `links/manifest.json` | Записи файлов, альбомов и аккаунтов |
+| `links/pending.txt` | Queue of direct URLs, albums and accounts |
+| `links/accs.txt` | Persistent list of tracked accounts |
+| `links/ready.txt` | Successfully completed batch links |
+| `links/failed.txt` | Links that failed after the last attempt |
+| `links/banned.txt` | Unavailable links, including HTTP 403/404/410 |
+| `links/ready_accs.txt` | Successfully processed accounts |
+| `links/failed_accs.txt` | Accounts that failed |
+| `links/banned_accs.txt` | Unavailable accounts |
+| `links/manifest.json` | Records of files, albums and accounts |
 
-Один URL на строку; пустые строки и строки с `#` в начале игнорируются batch-режимами. После финальной ошибки режим `2` переносит URL из `pending.txt` в `failed.txt`; чтобы повторить, верните URL в `pending.txt` вручную.
+One URL per line; blank lines and lines starting with `#` are ignored by batch modes. After a final failure, mode `2` moves the URL from `pending.txt` to `failed.txt`; to retry, add it back to `pending.txt` manually.
 
-`manifest.json` — отчёт, на основе которого решения не принимаются. Он записывается не чаще раза в 5 секунд и в конце каждого действия; если файл занят или диск недоступен, программа один раз предупреждает и продолжает скачивать.
+`manifest.json` is a report; no decision is made from it. It is written at most once every 5 seconds and at the end of every action; if the file is busy or the disk is unavailable the program warns once and keeps downloading.
 
-Имена папок и файлов подгоняются под Windows: запрещённые символы и управляющие знаки заменяются на `_`, имена устройств (`CON`, `NUL`, `COM1`…) получают `_` в начале, слишком длинные имена сокращаются (расширение файла сохраняется).
+Folder and file names are made safe for Windows: forbidden and control characters become `_`, device names (`CON`, `NUL`, `COM1`…) get a leading `_`, and names that are too long are shortened (the file extension is kept).
 
-### Импорт из закладок
+### Importing bookmarks
 
-1. Экспортируйте закладки браузера в `bookmarks*.html` и положите файл рядом с `main.py`.
-2. Запустите `python extract_links.py`, выберите файл и подтвердите операцию. Ссылки приводятся к единому виду `https://www.erome.com/a/<id>`, повторы убираются.
+1. Export browser bookmarks to `bookmarks*.html` and put the file next to `main.py`.
+2. Run `python extract_links.py`, choose the file and confirm. Links are brought to the single form `https://www.erome.com/a/<id>` and duplicates are removed.
 
 > [!WARNING]
-> Importer **заменяет содержимое** `links/pending.txt` найденными ссылками, а не объединяет их с очередью. Сохраните старый файл или объедините списки вручную.
+> The importer **replaces the contents** of `links/pending.txt` with the found links instead of merging them. Back up the old file or merge lists manually.
 
-## 🤖 Telegram-бот (режим 5)
+## 🤖 Telegram bot (mode 5)
 
-Режим 5 принимает ссылки на альбомы и профили Erome в чате с ботом, скачивает их и выкладывает в группу (в нужную тему форума) от имени вашего аккаунта — через «юзербота» на Telethon. Ссылок можно присылать сколько угодно и в любой момент: всё встаёт в очередь и обрабатывается по порядку, ждать окончания предыдущей не нужно.
+Mode 5 takes Erome album and profile links in a chat with a bot, downloads them and posts them to a group (into the chosen forum topic) from your own account, through a Telethon "userbot". You can send as many links as you like at any time: everything is queued and processed in order, there is no need to wait for the previous one to finish.
 
 ```mermaid
 flowchart LR
-    U["Ссылки в чате с ботом"] --> Q["Очередь<br/>links/tg_queue.json"]
-    Q --> D["Скачивание<br/>downloads/_telegram/"]
-    D --> S["Отправка юзерботом<br/>в группу / тему"]
-    S --> L["Журнал отправленного<br/>links/tg_sent.jsonl"]
+    U["Links in the bot chat"] --> Q["Queue<br/>links/tg_queue.json"]
+    Q --> D["Download<br/>downloads/_telegram/"]
+    D --> S["Userbot posts<br/>to the group / topic"]
+    S --> L["Ledger of what was sent<br/>links/tg_sent.jsonl"]
 ```
 
-### Настройка
+### Setup
 
-1. Создайте бота у [@BotFather](https://t.me/BotFather) (`/newbot`) и скопируйте токен.
-2. Запустите программу и выберите пункт `5`. Если `telegram.json` ещё нет, он создаётся из `telegram.example.json`, а токен программа спросит сама. Заполните остальные поля (таблица ниже); файл можно подготовить и вручную.
-3. `api_id` и `api_hash` берутся на [my.telegram.org](https://my.telegram.org) (API development tools). Вместо них можно указать `credentials_config_path` — путь к другому JSON-файлу с блоком `telegram` (`api_id`, `api_hash`).
-4. При первом запуске выводится QR-код: на телефоне откройте «Настройки → Устройства → Подключить устройство» и отсканируйте его **тем аккаунтом, от имени которого пойдёт отправка**. Если задан `account_id`, а вошли другим аккаунтом, сессия закрывается и вход нужно повторить. Облачный пароль (2FA), если он есть, вводится в консоли. Сессия хранится в `data/telegram.session`, повторно входить не нужно.
-5. Напишите боту `/start` и присылайте ссылки.
+1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy its token.
+2. Start the program and choose item `5`. If `telegram.json` does not exist yet it is created from `telegram.example.json`, and the program asks for the token itself. Fill in the other fields (table below); you can also prepare the file by hand.
+3. `api_id` and `api_hash` come from [my.telegram.org](https://my.telegram.org) (API development tools). Instead of them you can set `credentials_config_path` — a path to another JSON file with a `telegram` block (`api_id`, `api_hash`).
+4. On the first run a QR code is printed: on your phone open "Settings → Devices → Link Desktop Device" and scan it **with the account that should post**. If `account_id` is set and a different account signs in, the session is closed and the sign-in has to be repeated. The cloud password (2FA), if any, is typed in the console. The session is kept in `data/telegram.session`, so you sign in only once.
+5. Send the bot `/start` and then your links.
 
-`telegram.json` (образец — `telegram.example.json`):
+`telegram.json` (template: `telegram.example.json`):
 
-| Поле | Описание |
+| Field | Description |
 | --- | --- |
-| `bot_token` | Токен бота от @BotFather |
-| `owner_ids` | ID аккаунтов, которым разрешён бот; остальных бот игнорирует (в консоли один раз пишется их ID) |
-| `account_id` | ID аккаунта-отправителя: проверяется при входе; `null` — не проверять |
-| `chat_id` | ID группы, например `-1001234567890` |
-| `thread_id` | ID темы форума (число в конце ссылки `t.me/c/…/<thread_id>`); `0` — писать в основной чат |
-| `api_id`, `api_hash` | Данные приложения Telegram; можно оставить пустыми, если задан `credentials_config_path` |
-| `credentials_config_path` | Путь к JSON с `api_id` / `api_hash` (блок `telegram`), например от другого проекта |
-| `session_path` | Файл сессии без расширения, по умолчанию `data/telegram` |
-| `delete_after_upload` | Удалять локальные файлы сразу после того, как Telegram их принял (по умолчанию `true`) |
-| `upload_connections` | Предел числа соединений при отправке крупных файлов, 1–24 (по умолчанию `12`) |
+| `bot_token` | Bot token from @BotFather |
+| `owner_ids` | IDs of the accounts allowed to use the bot; everyone else is ignored (their ID is printed to the console once) |
+| `account_id` | ID of the sending account: checked at sign-in; `null` disables the check |
+| `chat_id` | Group ID, e.g. `-1001234567890` |
+| `thread_id` | Forum topic ID (the number at the end of a `t.me/c/…/<thread_id>` link); `0` posts to the main chat |
+| `api_id`, `api_hash` | Telegram application credentials; may stay empty when `credentials_config_path` is set |
+| `credentials_config_path` | Path to a JSON file with `api_id` / `api_hash` (`telegram` block), e.g. from another project |
+| `session_path` | Session file without extension, `data/telegram` by default |
+| `delete_after_upload` | Delete local files right after Telegram accepted them (`true` by default) |
+| `upload_connections` | Upper limit of connections when sending big files, 1-24 (`12` by default) |
 
-### Как пользоваться
+### Usage
 
-- Присылайте ссылки на альбомы (`erome.com/a/…`) и профили (`erome.com/имя`): по одной или сразу несколько в одном сообщении. Бот удаляет ваше сообщение и показывает состояние в одном сообщении-панели, которое обновляется само: текущий альбом (сколько скачано и отправлено, скорость, оставшееся время), очередь и недавно завершённое (время МСК).
-- Присылать можно в любой момент, в том числе пока идёт загрузка: ссылка встаёт в конец очереди, а бот сразу отвечает отдельным сообщением — что добавлено и на каком месте, какие ссылки уже были в очереди или в работе, что идёт прямо сейчас (альбом, сколько отправлено, оставшееся время). Ссылки, присланные подряд, попадают в один ответ; следующий ответ заменяет прежний, а старый убирается через 10 минут.
-- Кнопки панели: пауза / продолжить, отменить текущий альбом, очистить очередь (нажать дважды). Пауза не прерывает порцию файлов, которая отправляется сейчас: она дойдёт до конца, дальше ничего не начнётся.
-- Команды: `/start` — инструкция, `/queue` — вернуть панель в конец чата, `/resend ссылка` — выложить альбом заново (альбом, который сейчас в очереди или отправляется, трогать нельзя: бот попросит дождаться окончания).
-- Профиль разворачивается в альбомы, которых в группу ещё не отправляли, от старых к новым; уже полностью отправленные пропускаются. Читается он сразу после текущего альбома, не в конце очереди, поэтому результат (сколько альбомов добавлено или что профиль недоступен) известен быстро; его альбомы встают в очередь на место профиля. Чтобы догнать новые файлы в старом альбоме, пришлите ссылку на сам альбом.
-- Если сайт не ответил (страница альбома или профиля не открылась или прочиталась не целиком), задание не пропадает: оно откладывается и пробуется заново через 1, 3 и 10 минут (всего 4 попытки), а остальные задания идут своим чередом. В панели у такого задания написано, когда будет повтор.
-- В консоли работают `S` — статус, `P` — пауза, `Q` — остановиться после текущей порции файлов, `Ctrl+C` — прервать сразу. Очередь хранится на диске и продолжится при следующем запуске.
-- Если бот перестал получать сообщения (токен отозван, нет сети, тот же бот запущен ещё где-то), в консоли появится сообщение; при затянувшемся сбое оно повторяется не чаще раза в час.
+- Send album links (`erome.com/a/…`) and profile links (`erome.com/name`): one per message or several in a single message. The bot deletes your message and shows its state in a single panel message that updates itself: the current album (downloaded and sent counts, speed, time left), the queue and recently finished items (Moscow time).
+- You can send links at any moment, while a download is running too: the link joins the end of the queue and the bot answers at once in a message of its own — what was added and at which place, which links were already queued or in progress, and what is going on right now (the album, how much is sent, time left). Links sent in a row share one answer; the next answer replaces the previous one, and an old answer is removed after 10 minutes.
+- Panel buttons: pause / resume, cancel the current album, clear the queue (press twice). Pause does not interrupt the batch of files being sent right now: it runs to the end, then nothing new starts.
+- Commands: `/start` — instructions, `/queue` — bring the panel back to the bottom of the chat, `/resend link` — post an album again (an album that is queued or being sent right now must not be touched: the bot asks you to wait until it is done).
+- A profile expands into the albums that were not sent to the group yet, oldest first; albums that were fully sent are skipped. It is read right after the current album, not at the end of the queue, so the result (how many albums were added, or that the profile is unavailable) is known soon; its albums take the profile's place in the queue. To pick up new files in an old album, send the album link itself.
+- If the site did not answer (an album or profile page did not open or was read only in part), the job is not lost: it is put off and tried again after 1, 3 and 10 minutes (4 tries in all) while the other jobs carry on. The panel shows when the retry is due.
+- In the console: `S` — status, `P` — pause, `Q` — stop after the current batch of files, `Ctrl+C` — interrupt at once. The queue is stored on disk and continues on the next run.
+- If the bot stops receiving messages (token revoked, no network, the same bot running somewhere else) the console says so; during a long outage the message repeats at most once an hour.
 
-### Что и как отправляется
+### What is sent and how
 
-- Фото и видео уходят альбомами по 10 штук, подпись (название и ссылка на альбом) — на первом файле. Видео отправляются с превью и воспроизводятся без полной загрузки. GIF и фото, не подходящие под требования Telegram, уходят отдельными сообщениями или файлами. Видео без звука программа помечает для Telegram (`nosound_video`): иначе он принимает такой ролик за GIF и отклоняет весь альбом. Если Telegram всё же отказал, альбом уходит по одному файлу, а следующие ролики без звука идут отдельными сообщениями, остальное по-прежнему собирается в альбом.
-- Пока отправляется одна порция (до 10 файлов), скачивается следующая. Файлы лежат в `downloads/_telegram/`, не в основном архиве `downloads/`.
-- Журнал `links/tg_sent.jsonl` запоминает каждую принятую Telegram порцию, а каждому сообщению задан постоянный `random_id`: повторная ссылка, обрыв связи или перезапуск в любой момент не создают дублей. При повторе отправляется только недостающее.
-- Не скачавшиеся файлы пробуются ещё раз в конце альбома; если часть так и не пришла, альбом помечается как частично отправленный, а повторная ссылка докачает остаток.
-- Файлы, которые Telegram отверг сам по себе (не влезли в лимит, отвергнуты как негодное медиа), запоминаются в журнале: повторная ссылка и разворот профиля их заново не скачивают, а в панели у альбома написано «всё отправлено, кроме N файлов» с причиной. Временные сбои (обрыв связи, запрет группы) в журнал не попадают и при следующей попытке пробуются снова. `/resend` сбрасывает и эту отметку; если лимит аккаунта вырос (появился Premium), отметка перестаёт действовать сама.
-- Лимит файла в Telegram — 2 ГБ, у аккаунта с Premium — 4 ГБ.
-- Если группа или тема не принимает сообщения (тема закрыта, нет прав), очередь не теряется: программа проверяет снова всё реже — через 1, 2, 4 … до 15 минут, а в панели и консоли пишет причину.
-- Режим можно запустить только в одном окне.
+- Photos and videos go out as albums of up to 10, with a caption (title and album link) on the first file. Videos are sent with a preview and play without downloading the whole file. GIFs and photos that do not fit Telegram's photo limits go out as separate messages or files. A video without sound is marked for Telegram (`nosound_video`): otherwise Telegram takes it for a GIF and refuses the whole album. If Telegram refuses anyway, the album goes out file by file, and the following clips without sound go out as separate messages while everything else is still grouped into an album.
+- While one batch (up to 10 files) is being posted, the next one is downloaded. Files live in `downloads/_telegram/`, not in the main `downloads/` archive.
+- The ledger `links/tg_sent.jsonl` remembers every batch Telegram accepted, and every message has a fixed `random_id`: a repeated link, a lost connection or a restart at any moment never creates duplicates. Only what is missing is sent again.
+- Files that failed to download are tried once more at the end of the album; if some never arrive the album is marked as partly sent, and sending the link again fetches the rest.
+- Files that Telegram rejected on their own account (over the size limit, refused as unusable media) are written to the ledger: a repeated link or a profile expansion does not download them again, and the album shows "everything sent except N files" with the reason. Temporary trouble (a lost connection, a group that refuses messages) is not written down and is tried again next time. `/resend` clears this mark too; if the account's limit grows (Premium), the mark stops applying by itself.
+- Telegram's file limit is 2 GB, 4 GB for a Premium account.
+- If the group or topic does not accept messages (topic closed, no rights) the queue is kept and checked again less and less often — after 1, 2, 4 … up to 15 minutes — with the reason in the panel and console.
+- The mode can run in one window only.
 
-## 🗂️ Структура проекта
+## 🗂️ Project structure
 
 ```text
 EromeDownloader/
-├── main.py                # точка входа, меню режимов
-├── extract_links.py       # импорт ссылок из закладок
-├── start.bat              # лаунчер Windows (.venv + зависимости)
-├── config.json            # настройки
-├── telegram.example.json  # образец настроек Telegram-режима
-├── telegram.json          # ваши настройки Telegram-режима: токен и ID (в Git не входит)
-├── requirements.txt       # зависимости
+├── main.py                # entry point, mode menu
+├── extract_links.py       # bookmarks link importer
+├── start.bat              # Windows launcher (.venv + dependencies)
+├── config.json            # settings
+├── telegram.example.json  # template of the Telegram mode settings
+├── telegram.json          # your Telegram mode settings: token and IDs (not in Git)
+├── requirements.txt       # dependencies
 ├── erome/
-│   ├── config.py          # загрузка настроек
-│   ├── console.py         # логи, строка прогресса, горячие клавиши
-│   ├── downloader.py      # загрузка файлов
-│   ├── models.py          # модели данных
-│   ├── net.py             # сетевой слой
-│   ├── storage.py         # очереди и статус-файлы
-│   ├── manifest.py        # отчёт manifest.json
-│   ├── ui.py              # терминальный UI: цвета, строка статуса, ввод
-│   ├── urls.py            # разбор и сортировка URL
-│   ├── workflow.py        # сценарии режимов 1-4
-│   ├── tg_settings.py     # режим 5: telegram.json, токен, учётные данные
-│   ├── tg_state.py        # режим 5: очередь и журнал отправленного
-│   ├── tg_media.py        # режим 5: тип файла, метаданные видео, превью
-│   ├── tg_transport.py    # режим 5: соединение Telethon, загрузка файлов, вход по QR
-│   ├── tg_userbot.py      # режим 5: юзербот — альбомы и сообщения, что считается доставленным
-│   ├── tg_pipeline.py     # режим 5: скачивание → отправка
-│   ├── tg_bot.py          # режим 5: бот (aiogram), панель, команды, кнопки
-│   └── tg_mode.py         # режим 5: запуск — замок, логи, консоль, все задачи вместе
-├── downloads/             # скачанные файлы; _telegram/ — временные файлы режима 5 (в Git не входит)
-├── links/                 # очереди, manifest, tg_queue.json и tg_sent.jsonl (в Git не входит)
-└── data/                  # сессия Telegram и лог режима 5 (в Git не входит)
+│   ├── config.py          # settings loading
+│   ├── console.py         # logs, progress line, hot keys
+│   ├── downloader.py      # file downloading
+│   ├── models.py          # data models
+│   ├── net.py             # networking
+│   ├── storage.py         # queues and status files
+│   ├── manifest.py        # the manifest.json report
+│   ├── ui.py              # terminal UI: colours, status line, prompts
+│   ├── urls.py            # URL parsing and sorting
+│   ├── workflow.py        # mode 1-4 workflows
+│   ├── tg_settings.py     # mode 5: telegram.json, token, credentials
+│   ├── tg_state.py        # mode 5: queue and ledger of what was sent
+│   ├── tg_media.py        # mode 5: file kind, video metadata, thumbnails
+│   ├── tg_transport.py    # mode 5: Telethon connection, file uploads, QR sign-in
+│   ├── tg_userbot.py      # mode 5: userbot - albums and messages, what counts as delivered
+│   ├── tg_pipeline.py     # mode 5: download → send
+│   ├── tg_bot.py          # mode 5: bot (aiogram), panel, commands, buttons
+│   └── tg_mode.py         # mode 5: startup - lock, logs, console, all tasks together
+├── downloads/             # downloaded files; _telegram/ holds mode 5 scratch files (not in Git)
+├── links/                 # queues, manifest, tg_queue.json and tg_sent.jsonl (not in Git)
+└── data/                  # Telegram session and mode 5 log (not in Git)
 ```
 
-## 🔒 Безопасность и приватность
+## 🔒 Security & privacy
 
-- Для режимов 1–4 пароли, cookies и API keys не требуются.
-- Direct URL не ограничен доменом Erome; используйте только доверенные ссылки.
-- `downloads/`, `links/`, `data/`, `telegram.json`, `.venv/`, `.env`, файлы сессий и логи исключены из Git.
-- Токен бота и файл сессии `data/telegram.session` дают полный доступ к боту и аккаунту: не публикуйте их. Если токен попал в чужие руки, перевыпустите его у @BotFather (`/revoke`).
-- Manifest может содержать исходные URL и локальные имена файлов — учитывайте это перед публикацией.
+- Modes 1-4 need no passwords, cookies or API keys.
+- A direct URL is not restricted to the Erome domain; use trusted links only.
+- `downloads/`, `links/`, `data/`, `telegram.json`, `.venv/`, `.env`, session files and logs are excluded from Git.
+- The bot token and the session file `data/telegram.session` give full access to the bot and the account: never publish them. If a token leaks, reissue it with @BotFather (`/revoke`).
+- The manifest may contain source URLs and local file names — consider this before sharing it.
 
-## ⚠️ Ограничения
+## ⚠️ Limitations
 
-- Парсинг зависит от текущей HTML-разметки Erome: `og:title`, `<source>` и `img.img-back`.
-- Докачка работает только если сервер поддерживает `Range`; иначе файл загружается заново.
-- Размер может остаться неизвестным, если сервер не сообщает его через `HEAD` или range response.
-- Повреждённый manifest переносится в файл с суффиксом `.bad`; если его не удаётся ни прочитать, ни перенести, в этом запуске он не перезаписывается.
-- Режим 5 ограничен лимитами Telegram (скорость отправки, частота сообщений в группу): при ограничении программа сама ждёт и продолжает.
+- Parsing depends on Erome's current HTML markup: `og:title`, `<source>` and `img.img-back`.
+- Resuming works only if the server supports `Range`; otherwise the file is downloaded again.
+- Size may stay unknown if the server does not report it via `HEAD` or a range response.
+- A corrupted manifest is moved to a file with a `.bad` suffix; if it can be neither read nor moved, it is not overwritten during that run.
+- Mode 5 is bound by Telegram's limits (upload speed, message rate in a group): when throttled the program waits and carries on by itself.
 
-## 📄 Лицензия
+## 📄 License
 
-© 2026 Timofey Soroka. Программа распространяется на условиях [GNU General Public License v3.0](LICENSE): её можно свободно использовать, изменять и распространять, при этом изменённые версии, которые вы распространяете, остаются под той же лицензией и с открытым исходным кодом. Гарантий нет. Исходный код: <https://github.com/soroka01/EromeDownloader>.
+© 2026 Timofey Soroka. Released under the [GNU General Public License v3.0](LICENSE): you may use, change and redistribute the program freely; modified versions that you distribute must stay under the same license, with their source code available. There is no warranty. Source code: <https://github.com/soroka01/EromeDownloader>.
 
-## 💬 Поддержка
+## 💬 Support
 
-Можно [форкнуть репозиторий](https://github.com/soroka01/EromeDownloader/fork) и доработать под себя. Если проект пригодился, поставьте [Star](https://github.com/soroka01/EromeDownloader) — так я увижу, что он был кому-то полезен.
+Feel free to [fork the repository](https://github.com/soroka01/EromeDownloader/fork) and adapt it. If the project helped you, leave a [Star](https://github.com/soroka01/EromeDownloader) so I know it was useful.
 
 ---
 
