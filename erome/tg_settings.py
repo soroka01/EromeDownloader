@@ -112,10 +112,25 @@ def _int_value(raw: dict[str, Any], key: str, *, required: bool = True) -> int |
         if required:
             raise SettingsError(f"В telegram.json не задано поле {key}")
         return None
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise SettingsError(f"Поле {key} в telegram.json должно быть целым числом")  # not True->1, not 1.9->1
     try:
         return int(value)
     except (TypeError, ValueError):
         raise SettingsError(f"Поле {key} в telegram.json должно быть целым числом") from None
+
+
+def _bool_value(raw: dict[str, Any], key: str, default: bool) -> bool:
+    """true/false (also the strings "true"/"false" and 0/1); anything else is an error, not a guess: "false" written
+    as text used to count as true, which here means deleting the files after sending."""
+    value = raw.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise SettingsError(f"Поле {key} в telegram.json должно быть true или false")
 
 
 def _owner_ids(raw: dict[str, Any]) -> frozenset[int]:
@@ -128,8 +143,8 @@ def _owner_ids(raw: dict[str, Any]) -> frozenset[int]:
         owners = frozenset(int(item) for item in value)
     except (TypeError, ValueError):
         raise SettingsError("owner_ids в telegram.json должен состоять из целых чисел") from None
-    if owners == {PLACEHOLDER_OWNER_ID}:
-        raise SettingsError("В telegram.json замените owner_ids образца на свой Telegram ID")
+    if PLACEHOLDER_OWNER_ID in owners:  # also next to a real ID: that stranger account would be allowed to use the bot
+        raise SettingsError("В telegram.json уберите из owner_ids ID образца и оставьте свой Telegram ID")
     return owners
 
 
@@ -156,8 +171,10 @@ def _api_credentials(raw: dict[str, Any]) -> tuple[int, str]:
 def load_settings() -> TelegramSettings:
     raw = read_raw()
     token = str(raw.get("bot_token") or "").strip()
-    if not (bot_token_is_set(raw) and valid_bot_token(token)):
+    if not bot_token_is_set(raw):
         raise SettingsError("В telegram.json не задан токен бота (bot_token)")
+    if not valid_bot_token(token):
+        raise SettingsError("bot_token в telegram.json не похож на токен бота (ожидается вид 123456789:AAH…)")
 
     chat_id = _int_value(raw, "chat_id")
     if chat_id in (None, PLACEHOLDER_CHAT_ID):
@@ -178,7 +195,7 @@ def load_settings() -> TelegramSettings:
         api_id=api_id,
         api_hash=api_hash,
         session_path=resolve_path(BASE_DIR, str(raw.get("session_path") or DEFAULT_SESSION_PATH)),
-        delete_after_upload=bool(raw.get("delete_after_upload", True)),
+        delete_after_upload=_bool_value(raw, "delete_after_upload", True),
         upload_connections=max(1, min(MAX_UPLOAD_CONNECTIONS, connections)),
     )
 

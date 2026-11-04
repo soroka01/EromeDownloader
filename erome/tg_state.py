@@ -83,6 +83,8 @@ class TelegramState:
         self._sent: dict[str, set[str]] = {}
         self._done: set[str] = set()
         self._refused: dict[str, dict[str, tuple[int, str]]] = {}  # album -> {file key: (upload limit then, reason)}
+        self._save_failing = False  # the queue file could not be written (said once, and once again when it works)
+        self._tail_checked = False  # the last line of the ledger is known to end with a newline
 
     # ----- persistence ------------------------------------------------------------------------
 
@@ -137,7 +139,19 @@ class TelegramState:
             "history": [asdict(job) for job in self.history[-HISTORY_LIMIT:]],
             "panels": self.panels,
         }
-        write_text_atomic(self.state_path, json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
+        text = json.dumps(payload, ensure_ascii=False, indent=1) + "\n"
+        try:
+            write_text_atomic(self.state_path, text, durable=True)  # durable: an acknowledged link survives a power cut
+        except OSError as exc:
+            # The queue in memory stays the truth and the next change writes it again. A file that an antivirus or the
+            # indexer holds for a moment must not end the worker, or leave the owner's link without an answer.
+            if not self._save_failing:
+                self._save_failing = True
+                log_warn(f"Не удалось сохранить очередь Telegram ({exc}); повторю при следующем изменении")
+            return
+        if self._save_failing:
+            self._save_failing = False
+            log_warn("Очередь Telegram снова сохраняется")
 
     # ----- queue ------------------------------------------------------------------------------
 
@@ -184,11 +198,16 @@ class TelegramState:
             job.status = QUEUED
             self.save()
 
-    def defer(self, job: Job, seconds: float, note: str) -> None:
-        """A temporary problem (the site does not answer): the job goes back and is not started for `seconds`."""
+    def defer(self, job: Job, seconds: float, note: str, *, count_try: bool = True) -> None:
+        """A temporary problem (the site does not answer): the job goes back and is not started for `seconds`.
+
+        `count_try=False` for a wait that is nobody's fault (the whole connection is down): it does not use up one of
+        the few tries after which a job is given up.
+        """
         if job in self.queue:
             job.status = QUEUED
-            job.tries += 1
+            if count_try:
+                job.tries += 1
             job.not_before = time.time() + seconds
             job.note = note
             self.save()
@@ -251,7 +270,8 @@ class TelegramState:
         self._refused.clear()
         if not self.ledger_path.exists():
             return
-        with self.ledger_path.open("r", encoding="utf-8") as stream:
+        # errors="replace": a multi-byte character cut in half by a crash must cost one line, not the whole start
+        with self.ledger_path.open("r", encoding="utf-8", errors="replace") as stream:
             for line in stream:
                 try:
                     record = json.loads(line)
@@ -278,10 +298,26 @@ class TelegramState:
     def _append(self, record: dict[str, Any]) -> None:
         record["t"] = int(time.time())
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        if not self._tail_checked and not self._ends_with_newline():
+            line = "\n" + line  # a crash cut the last line short: this record must not be glued to it and lost
+        self._tail_checked = False  # until the write below is known to have gone through
         with self.ledger_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stream.write(line)
             stream.flush()
             os.fsync(stream.fileno())
+        self._tail_checked = True
+
+    def _ends_with_newline(self) -> bool:
+        try:
+            with self.ledger_path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() == 0:
+                    return True
+                stream.seek(-1, os.SEEK_END)
+                return stream.read(1) == b"\n"
+        except FileNotFoundError:
+            return True
 
     def sent_keys(self, album_url: str) -> set[str]:
         return set(self._sent.get(normalize_download_url(album_url), ()))

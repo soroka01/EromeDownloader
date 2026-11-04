@@ -86,7 +86,8 @@ def _run_ffmpeg(args: list[str], timeout: int) -> subprocess.CompletedProcess[by
         return None
     try:
         return subprocess.run(
-            [exe, "-hide_banner", *args],
+            [exe, "-hide_banner", "-nostdin", *args],
+            stdin=subprocess.DEVNULL,  # ffmpeg reads the console otherwise and can eat the owner's hot keys (Q, P, S)
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -125,11 +126,14 @@ def make_thumbnail(path: Path, destination: Path, at_seconds: float = 1.0) -> Pa
         "-frames:v", "1", "-vf", "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease", str(destination),
     ]
     completed = _run_ffmpeg(args, THUMBNAIL_TIMEOUT_SECONDS)
-    if completed is None or completed.returncode != 0:
-        destination.unlink(missing_ok=True)
-        return None
-    if not destination.is_file() or destination.stat().st_size == 0:
-        destination.unlink(missing_ok=True)
+    try:  # a thumbnail is cosmetic: a file that an antivirus holds for a moment must not fail the whole batch
+        if completed is None or completed.returncode != 0:
+            destination.unlink(missing_ok=True)
+            return None
+        if not destination.is_file() or destination.stat().st_size == 0:
+            destination.unlink(missing_ok=True)
+            return None
+    except OSError:
         return None
     return destination
 
@@ -202,10 +206,10 @@ def classify(path: Path, size: int) -> str:
 
 
 def mime_type(path: Path, kind: str) -> str:
-    guessed = mimetypes.guess_type(path.name)[0]
-    if guessed:
-        return guessed
-    return "video/mp4" if kind == "video" else "application/octet-stream"
+    guessed = mimetypes.guess_type(path.name)[0]  # on Windows this reads the registry, which any program can edit
+    if kind == "video":
+        return guessed if guessed and guessed.startswith("video/") else "video/mp4"
+    return guessed or "application/octet-stream"
 
 
 async def prepare_item(path: Path, key: str, random_id: int) -> SendItem:

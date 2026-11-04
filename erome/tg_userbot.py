@@ -57,17 +57,20 @@ class DestinationError(RuntimeError):
 class GroupRejected(RuntimeError):
     """Telegram refused the whole album; nothing was posted and the files can still go out one by one."""
 
-    def __init__(self, reason: str, code: str = "") -> None:
+    def __init__(self, reason: str, code: str = "", culprit: SendItem | None = None) -> None:
         super().__init__(reason)
         self.code = code  # the RPC code of the refusal when there was one (MEDIA_EMPTY, ...)
+        self.culprit = culprit  # the file that was refused when Telegram said which one (the registration of the media)
 
 
-DESTINATION_ERRORS = error_classes(
-    "ChatWriteForbiddenError", "ChatAdminRequiredError", "UserBannedInChannelError", "ChannelPrivateError",
-    "ChannelInvalidError", "PeerIdInvalidError", "TopicDeletedError", "ChatRestrictedError",
-    "ChatSendMediaForbiddenError", "ChatSendPhotosForbiddenError", "ChatSendVideosForbiddenError",
-    "ChatSendDocsForbiddenError", "ChatSendGifsForbiddenError", "ChatSendPlainForbiddenError",
-)
+# RPC codes that mean "this chat or topic refuses our messages". Matched by code, not by Telethon's class: the installed
+# Telethon has no class for some of them (CHAT_SEND_DOCS_FORBIDDEN, TOPIC_CLOSED) and raises a generic error instead.
+DESTINATION_CODES = frozenset({
+    "CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED", "USER_BANNED_IN_CHANNEL", "CHANNEL_PRIVATE", "CHANNEL_INVALID",
+    "PEER_ID_INVALID", "TOPIC_DELETED", "TOPIC_CLOSED", "CHAT_RESTRICTED", "USER_NOT_PARTICIPANT",
+    "CHAT_SEND_MEDIA_FORBIDDEN", "CHAT_SEND_PHOTOS_FORBIDDEN", "CHAT_SEND_VIDEOS_FORBIDDEN",
+    "CHAT_SEND_DOCS_FORBIDDEN", "CHAT_SEND_GIFS_FORBIDDEN", "CHAT_SEND_PLAIN_FORBIDDEN",
+})
 PHOTO_ERRORS = error_classes(
     "PhotoInvalidDimensionsError", "PhotoSaveFileInvalidError", "ImageProcessFailedError", "PhotoExtInvalidError",
     "PhotoCropSizeSmallError", "PhotoInvalidError", "MediaInvalidError",
@@ -91,7 +94,7 @@ TRANSIENT_ERRORS = (
 
 
 def is_destination_error(exc: BaseException) -> bool:
-    return isinstance(exc, DESTINATION_ERRORS) or "TOPIC_CLOSED" in str(getattr(exc, "message", "") or exc)
+    return error_code(exc) in DESTINATION_CODES
 
 
 def is_file_error(exc: BaseException) -> bool:
@@ -222,7 +225,7 @@ class Userbot(Transport):
                 item.thumb_file = await asyncio.wait_for(client.upload_file(item.thumb), REQUEST_TIMEOUT_SECONDS)
             except (errors.FloodError, *SESSION_ERRORS, *TRANSIENT_RPC_ERRORS):
                 raise
-            except errors.RPCError as exc:
+            except (errors.RPCError, FileNotFoundError, PermissionError) as exc:  # not the link: a network error is not this
                 item.thumb_refused = True
                 LOG.info("Thumbnail of %s was not accepted (%s); sending without it", item.path.name, describe_error(exc))
 
@@ -251,11 +254,14 @@ class Userbot(Transport):
 
     @staticmethod
     def _forget_upload(item: SendItem) -> bool:
-        """Drop a handle Telegram no longer accepts. False once it happened twice: then the file itself is bad."""
+        """Drop a handle Telegram no longer accepts, so the file is uploaded again. After two such resets the file itself
+        is bad: False, and the handle is left alone (the caller does not retry, so nothing may be missing from it)."""
+        if item.stale_resets >= 2:
+            return False
         item.stale_resets += 1
         item.file = item.thumb_file = None
         item.uploaded_at = 0.0
-        return item.stale_resets <= 2
+        return True
 
     def _uploaded_media(self, item: SendItem) -> Any:
         if item.kind == "photo":
@@ -300,7 +306,7 @@ class Userbot(Transport):
                 LOG.info(
                     "Telegram refused the album (%s; %s); sending its %d files one by one", exc, describe_unit(unit), len(unit)
                 )
-                if self.silent_in_albums and exc.code.startswith("MEDIA_") and any(item.silent for item in unit):
+                if self.silent_in_albums and self._silent_video_to_blame(unit, exc):
                     self.silent_in_albums = False
                     LOG.warning("An album with a video without sound was refused: such videos go out alone from now on")
             else:
@@ -315,6 +321,19 @@ class Userbot(Transport):
             else:
                 refused[item.key] = reason
         return refused, delivered_any
+
+    @staticmethod
+    def _silent_video_to_blame(unit: list[SendItem], exc: GroupRejected) -> bool:
+        """Did a video without sound make Telegram refuse this album? Another file's refusal must not decide it.
+
+        When Telegram named the refused file it must be such a video; when it refused the album as a whole, the
+        symptom of an unannounced silent video is MEDIA_EMPTY.
+        """
+        if not exc.code.startswith("MEDIA_"):
+            return False
+        if exc.culprit is not None:
+            return exc.culprit.silent
+        return exc.code == "MEDIA_EMPTY" and any(item.silent for item in unit)
 
     async def _send_single(self, item: SendItem, caption: str) -> Refusal | None:
         """Post one file. None = delivered; otherwise the reason Telegram refused it."""
@@ -367,7 +386,7 @@ class Userbot(Transport):
                     raise DestinationError(human_error(exc)) from exc
                 if item.kind == "photo" and isinstance(exc, PHOTO_ERRORS):
                     item.kind = "file"  # a document cannot join an album: the files go out one by one
-                raise GroupRejected(describe_error(exc), error_code(exc)) from exc
+                raise GroupRejected(describe_error(exc), error_code(exc), item) from exc
             media = getattr(registered, "photo", None) or getattr(registered, "document", None)
             if media is None:
                 raise GroupRejected("Telegram did not return the uploaded media")
@@ -388,7 +407,9 @@ class Userbot(Transport):
         except TRANSIENT_RPC_ERRORS as exc:
             raise DeliveryUncertain(f"{type(exc).__name__}: {exc}") from exc
         except STALE_UPLOAD_ERRORS as exc:
-            if all([self._forget_upload(item) for item in unit]):
+            if all(item.stale_resets < 2 for item in unit):  # checked first: a half-reset album would go out broken
+                for item in unit:
+                    self._forget_upload(item)
                 raise DeliveryUncertain(f"stale upload in the album: {describe_error(exc)}") from exc
             raise GroupRejected(describe_error(exc)) from exc
         except errors.RPCError as exc:

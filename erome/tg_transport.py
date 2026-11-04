@@ -153,7 +153,7 @@ ERROR_TEXTS = {
     "CHAT_SEND_DOCS_FORBIDDEN": "в группе запрещена отправка файлов",
     "CHAT_SEND_GIFS_FORBIDDEN": "в группе запрещена отправка GIF",
     "CHAT_SEND_PLAIN_FORBIDDEN": "в группе запрещена отправка сообщений",
-    "MEDIA_EMPTY": "файл пустой",
+    "MEDIA_EMPTY": "Telegram счёл файл пустым или неподдерживаемым",
     "MEDIA_INVALID": "Telegram не принял файл",
     "PHOTO_INVALID": "Telegram не принял картинку",
     "PHOTO_INVALID_DIMENSIONS": "у картинки неподходящие размеры",
@@ -209,9 +209,19 @@ class _QuietTelegramClient(TelegramClient):
     request in flight (uploads included). This program only sends, so the loop is replaced by an idle one.
     """
 
+    def _is_current(self, handle_name: str) -> bool:
+        """False for a loop that a later `connect()` has replaced.
+
+        `connect()` starts new loops and forgets the old ones without stopping them. Telethon's own loops end by
+        themselves when the connection drops; these sleep first, so one that wakes up after a quick reconnect would
+        see a connected client again and live on next to its successor - one more pair after every short outage.
+        """
+        handle = getattr(self, handle_name, None)
+        return handle is None or handle is asyncio.current_task()
+
     async def _update_loop(self) -> None:
         queue = getattr(self, "_updates_queue", None)
-        while self.is_connected():
+        while self.is_connected() and self._is_current("_updates_handle"):
             if queue is None:
                 await asyncio.sleep(30)
                 continue
@@ -224,8 +234,10 @@ class _QuietTelegramClient(TelegramClient):
         loop never yields and the whole event loop starves (no log lines, uploads stuck, memory growing). This
         version always sleeps first.
         """
-        while self.is_connected():
+        while self.is_connected() and self._is_current("_keepalive_handle"):
             await asyncio.sleep(60)
+            if not self._is_current("_keepalive_handle"):
+                return
             try:
                 await self._clean_exported_senders()
                 if not self._sender._transport_connected():
@@ -378,6 +390,12 @@ class Transport:
             await asyncio.wait_for(self._ready.wait(), timeout)
         except asyncio.TimeoutError:
             return False
+        if not self.ready:
+            # A stale event: the client dropped and the supervisor has not noticed yet. Returning at once would let a
+            # caller that loops on this call spin without ever giving the event loop back (and the supervisor, which
+            # would clear the state, never runs), so hand control over for a moment.
+            self._ready.clear()
+            await asyncio.sleep(0.2)
         return self.ready
 
     def status_text(self) -> str:
@@ -401,7 +419,8 @@ class Transport:
         return self.status_text()
 
     def _set_state(self, state: str, error: str = "") -> None:
-        if state != self.state or error != self.error:
+        # A new reason for the same offline state is not news: the failed attempt behind it is logged on its own.
+        if state != self.state or (error != self.error and state != STATE_OFFLINE):
             LOG.info("Telegram userbot state: %s%s", state, f" ({error})" if error else "")
         self.state = state
         self.error = error
@@ -586,6 +605,12 @@ class Transport:
             path, file_name=path.name, progress_callback=lambda sent, _total: handle.set(sent)
         )
 
+    @staticmethod
+    def _without_updates(client: TelegramClient, request: Any) -> Any:
+        """Telethon wraps every request of an update-less client like this; a connection of our own must do the same,
+        or the server subscribes it to the account's updates (up to two dozen extra streams that nobody reads)."""
+        return functions.InvokeWithoutUpdatesRequest(request) if getattr(client, "_no_updates", False) else request
+
     async def _new_upload_sender(self, client: TelegramClient) -> MTProtoSender:
         """One more connection to the client's own DC with the same auth key (parts of one file are spread over them)."""
         dc = await client._get_dc(client.session.dc_id)
@@ -601,7 +626,7 @@ class Transport:
             )
             init = copy.copy(client._init_request)
             init.query = functions.help.GetConfigRequest()
-            await sender.send(functions.InvokeWithLayerRequest(LAYER, init))
+            await sender.send(self._without_updates(client, functions.InvokeWithLayerRequest(LAYER, init)))
         except BaseException:
             with contextlib.suppress(Exception):
                 await sender.disconnect()
@@ -695,9 +720,7 @@ class Transport:
     async def _close_extra_senders(self) -> None:
         senders, self._extra_senders = self._extra_senders, []
         self._extra_owner = None
-        for sender in senders:
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(sender.disconnect(), 5)
+        await asyncio.gather(*(self._safe_disconnect_sender(sender) for sender in senders))  # all at once, not 5 s each
 
     def _discard_extra_sender(self, sender: MTProtoSender, reason: object) -> None:
         LOG.warning("Extra upload connection dropped (%s); its parts go over the main connection", reason)
@@ -731,7 +754,9 @@ class Transport:
             ok: Any = None
             if lane is not None:
                 try:
-                    ok = await asyncio.wait_for(lane.send(request), REQUEST_TIMEOUT_SECONDS)
+                    ok = await asyncio.wait_for(
+                        lane.send(self._without_updates(client, request)), REQUEST_TIMEOUT_SECONDS
+                    )
                 except errors.FloodError:
                     raise
                 except asyncio.CancelledError:
@@ -759,8 +784,7 @@ class Transport:
                     data = stream.read(part_size)
                     while len(pending) >= self.parallel_parts * len(lanes):
                         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                        for finished in done:
-                            finished.result()
+                        self._raise_first_failure(done)
                     pending.add(asyncio.ensure_future(send(index, data, lanes[index % len(lanes)])))
             if pending:
                 await asyncio.gather(*pending)
@@ -770,6 +794,18 @@ class Transport:
             await asyncio.gather(*pending, return_exceptions=True)
             raise
         return types.InputFileBig(id=file_id, parts=part_count, name=path.name)
+
+    @staticmethod
+    def _raise_first_failure(done: set[asyncio.Future[None]]) -> None:
+        """Raise the first error of the finished part tasks; the others are read too, so none is left unretrieved."""
+        failures: list[BaseException] = []
+        for finished in done:
+            try:
+                finished.result()
+            except BaseException as exc:  # noqa: BLE001 - collected, the first one is raised below
+                failures.append(exc)
+        if failures:
+            raise failures[0]
 
     def _forget_lane(self, lanes: list[MTProtoSender | None], lane: MTProtoSender, reason: object) -> None:
         if lane in lanes:
@@ -790,13 +826,19 @@ class Transport:
                     last_sent, idle_since = handle.sent, time.monotonic()
                 elif time.monotonic() - idle_since > UPLOAD_STALL_SECONDS:
                     task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                    try:
                         await task
+                    except asyncio.CancelledError:
+                        if task_is_cancelling():  # the cancellation of the upload is expected, one aimed at us is not
+                            raise
+                    except Exception:
+                        pass
                     if client is self.client:
                         self._drop_connection(f"upload stalled for {UPLOAD_STALL_SECONDS:.0f}s")
                     raise ConnectionError(f"upload stalled for {UPLOAD_STALL_SECONDS:.0f}s")
         except asyncio.CancelledError:
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)  # let the upload close its file before the caller goes on
             raise
 
 

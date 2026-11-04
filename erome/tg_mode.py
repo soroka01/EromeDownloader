@@ -18,8 +18,13 @@ from typing import Callable
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
-from aiogram.types import BotCommand
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
+from aiogram.types import BotCommand, User
 
 from erome.config import BASE_DIR
 from erome.console import RunControl, hotkeys, log, log_error, log_success, log_warn
@@ -232,6 +237,25 @@ async def console_status_loop(app: BotApp) -> None:
         await asyncio.sleep(1.0)
 
 
+async def connect_bot(bot: Bot, control: RunControl) -> User | None:
+    """`getMe` with patience: a PC that starts before its network is up must wait for it, not give up with a traceback.
+
+    A refused token is raised at once (waiting would not help). None when the owner asked to stop in the meantime.
+    """
+    delay, announced = 3.0, False
+    while True:
+        try:
+            return await bot.get_me()
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            if control.stop:
+                return None
+            if not announced:
+                announced = True
+                log_warn(f"Нет связи с Telegram ({type(exc).__name__}): жду сеть и повторяю")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+
 async def serve(settings: TelegramSettings, control: TelegramControl) -> None:
     ensure_runtime_dirs()
     state = TelegramState()
@@ -248,13 +272,16 @@ async def serve(settings: TelegramSettings, control: TelegramControl) -> None:
     dispatcher.include_router(build_router(app))
 
     try:
-        me = await bot.get_me()
+        me = await connect_bot(bot, control)
     except TelegramUnauthorizedError:
         await bot.session.close()
         raise SettingsError("Telegram не принял токен бота: проверьте bot_token в telegram.json") from None
     except BaseException:
         await bot.session.close()
         raise
+    if me is None:  # stopped from the console while waiting for the network
+        await bot.session.close()
+        return
     try:
         await bot.set_my_commands(
             [
@@ -365,6 +392,8 @@ def run_telegram_bot() -> bool:
         try:
             with console_selection_off():
                 asyncio.run(_run(settings))
+        except KeyboardInterrupt:
+            pass  # Ctrl+C is an ordinary way to stop: serve() has already shut everything down and saved the queue
         except SettingsError as exc:
             log_error(str(exc))
             return False

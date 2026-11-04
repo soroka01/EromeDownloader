@@ -50,6 +50,7 @@ PANEL_LIMIT = 3900
 ANSWER_MERGE_SECONDS = 8.0  # links that follow an answer this closely are added to that same message
 ANSWER_KEEP_SECONDS = 600.0  # an answer stays this long (or until the next one comes) and is then removed
 ANSWER_MAX_LINES = 12
+REFRESH_LOG_EVERY_SECONDS = 300.0  # a panel that keeps failing to refresh is reported this often
 
 _LINK_RE = re.compile(r"(?<![\w.@/-])(?:https?://)?(?:www\.)?erome\.com/[^\s<>\"']+", re.IGNORECASE)
 _TRAILING = ").,;:!?]}>\"'"
@@ -175,6 +176,9 @@ class BotApp:
         self._answers: dict[int, Answer] = {}
         self._answer_locks: dict[int, asyncio.Lock] = {}
         self._denied_logged: set[int] = set()
+        self._edit_hold: dict[int, float] = {}  # chat -> monotonic time before which Telegram asked not to edit again
+        self._refresh_failures = 0  # consecutive failed passes of the refresh loop
+        self._refresh_logged_at = 0.0
 
     # ----- text of the panel ------------------------------------------------------------------------
 
@@ -283,8 +287,11 @@ class BotApp:
         """Draw the panel: edit the existing message, or create it (fresh=True moves it to the bottom of the chat)."""
         async with self._lock(chat_id):
             message_id = self.state.panel_id(chat_id)
-            if not fresh and message_id and time.monotonic() - self._last_edit.get(chat_id, 0.0) < PANEL_USER_EDIT_GAP:
-                return  # edited a moment ago (a burst of links): the refresh loop draws the change right after
+            now = time.monotonic()
+            if not fresh and message_id and (
+                now - self._last_edit.get(chat_id, 0.0) < PANEL_USER_EDIT_GAP or now < self._edit_hold.get(chat_id, 0.0)
+            ):
+                return  # edited a moment ago (a burst of links) or told to wait: the refresh loop draws the change later
             text, markup = self.render()
             if fresh and message_id:
                 with contextlib.suppress(TelegramAPIError):
@@ -304,8 +311,10 @@ class BotApp:
         try:
             await self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
         except TelegramRetryAfter as exc:
-            await asyncio.sleep(exc.retry_after + 1)
-            return True  # the next refresh repeats the edit
+            # Not slept through here: this runs under the chat's lock, and a flood wait of minutes would hold every
+            # reply to the owner behind it. Edits of this chat just pause; the next refresh after that repeats it.
+            self._edit_hold[chat_id] = time.monotonic() + exc.retry_after + 1
+            return True
         except TelegramBadRequest as exc:
             reason = str(exc).lower()
             if "message is not modified" in reason:
@@ -329,7 +338,22 @@ class BotApp:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # a cosmetic loop must never take the whole mode down
-                LOG.warning("Panel refresh failed: %s: %s", type(exc).__name__, exc)
+                self._note_refresh_failure(exc)
+            else:
+                if self._refresh_failures:
+                    LOG.info("Panel refresh works again (%d failed passes before)", self._refresh_failures)
+                    self._refresh_failures = 0
+
+    def _note_refresh_failure(self, exc: Exception) -> None:
+        """Say that the panel could not be refreshed - the first time, then every few minutes, not every second: a long
+        outage would otherwise fill (and rotate away) the log that explains it."""
+        self._refresh_failures += 1
+        now = time.monotonic()
+        if self._refresh_failures == 1 or now - self._refresh_logged_at >= REFRESH_LOG_EVERY_SECONDS:
+            self._refresh_logged_at = now
+            LOG.warning(
+                "Panel refresh failed: %s: %s (%d in a row)", type(exc).__name__, exc, self._refresh_failures
+            )
 
     async def _refresh_panel(self, chat_id: int) -> None:
         message_id = self.state.panel_id(chat_id)
@@ -338,9 +362,14 @@ class BotApp:
         text, markup = self.render()
         if view_signature(text, markup) == self._last_view.get(chat_id):
             return
-        if time.monotonic() - self._last_edit.get(chat_id, 0.0) < PANEL_EDIT_INTERVAL:
+        now = time.monotonic()
+        if now - self._last_edit.get(chat_id, 0.0) < PANEL_EDIT_INTERVAL or now < self._edit_hold.get(chat_id, 0.0):
             return
         async with self._lock(chat_id):
+            # Waiting for the lock may have let `show_panel(fresh=True)` replace the panel: editing the old message
+            # would fail with "not found", and forgetting it would erase the id of the new one.
+            if self.state.panel_id(chat_id) != message_id:
+                return
             if not await self._edit(chat_id, message_id, text, markup):
                 self.state.set_panel(chat_id, None)  # deleted by the user: back on their next message
 

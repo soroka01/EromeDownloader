@@ -38,6 +38,7 @@ from erome.tg_state import (
     DONE,
     FAILED,
     PARTIAL,
+    RUNNING,
     Job,
     TelegramState,
     file_key,
@@ -60,6 +61,9 @@ DESTINATION_RETRY_MAX_SECONDS = 900
 SCAN_ATTEMPTS = 3
 JOB_RETRY_SECONDS = (60, 180, 600)  # waits between the tries of a job whose page could not be read
 MAX_JOB_TRIES = len(JOB_RETRY_SECONDS) + 1
+JOB_OFFLINE_RETRY_SECONDS = 60  # a job that waited because the connection is down looks again this often
+WORKER_RECOVERY_PAUSE_SECONDS = 5  # breathing space after an unexpected failure of the worker
+CAPTION_LIMIT = 900  # the caption of the first message (Telegram allows 1024, 4096 for Premium)
 _STAGING_CODE_RE = re.compile(r"\[([^\[\]]+)\]$")
 
 
@@ -182,7 +186,15 @@ class Pipeline:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._wake.wait(), 1.0)
                 continue
-            await self._process(job)
+            try:
+                await self._process(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # whatever went wrong inside, the worker must outlive it
+                LOG.exception("The worker failed on %s", job.url)
+                if job in self.state.queue and job.status == RUNNING:
+                    self._defer(job, f"внутренняя ошибка: {type(exc).__name__}")  # tried again, given up after a few tries
+                await asyncio.sleep(WORKER_RECOVERY_PAUSE_SECONDS)
 
     async def _process(self, job: Job) -> None:
         self.state.mark_running(job)
@@ -206,9 +218,12 @@ class Pipeline:
                 raise
             if self._cancel_job_id == job.id:
                 self._finish(job, CANCELLED, "отменено")
-            else:  # stop() cancelled it: the job continues on the next start
+            elif self._stopping:  # stop() cancelled it: the job continues on the next start
                 self.state.requeue(job)
                 finished = False
+            else:  # something else cancelled the work (a library dropped a request we were awaiting): not a stop
+                LOG.warning("The job %s was cancelled, but nobody asked to stop it", job.url)
+                self._defer(job, "работа прервана неожиданно")
         except StopRequested:
             self.state.requeue(job)
             finished = False
@@ -234,6 +249,12 @@ class Pipeline:
     def _defer(self, job: Job, reason: str) -> None:
         """The site did not answer properly: the job waits (1, 3, 10 minutes) while the others go on, then starts again."""
         label = shorten_text(job.title or short_url(job.url), 70)
+        if not self.userbot.ready:
+            # No link to Telegram usually means no internet at all: the site is not to blame, so this wait does not use
+            # up one of the job's tries (a night-long outage would otherwise fail every album that was queued).
+            self.state.defer(job, JOB_OFFLINE_RETRY_SECONDS, reason, count_try=False)
+            log_warn(f"«{label}»: {reason}. Нет связи, повторю через {wait_text(JOB_OFFLINE_RETRY_SECONDS)}")
+            return
         if job.tries + 1 >= MAX_JOB_TRIES:
             self._finish(job, FAILED, f"{reason} (попыток: {MAX_JOB_TRIES})")
             return
@@ -348,7 +369,7 @@ class Pipeline:
             f"{plural(album.media_count, 'файла', 'файлов', 'файлов')}"
         )
 
-        caption = f"{album.title}\n{album.url}"[:900]
+        caption = self._caption(album)
         caption_pending = True
         batches = [todo[i : i + BATCH_SIZE] for i in range(0, len(todo), BATCH_SIZE)]
         fetches: dict[int, asyncio.Task[dict[str, DownloadResult]]] = {}
@@ -410,6 +431,14 @@ class Pipeline:
         detail = f" ({'; '.join(reasons[:2])})" if reasons else ""
         note = f"отправлено {sent} из {len(todo)}, не удалось {missing}{detail}"
         return (PARTIAL if sent else FAILED), note
+
+    @staticmethod
+    def _caption(album: AlbumData) -> str:
+        """Title and link; a long title is shortened, never the link (cutting the whole text would break it)."""
+        tail = f"\n{album.url}"
+        room = max(CAPTION_LIMIT - len(tail), 0)
+        title = album.title if len(album.title) <= room else album.title[: max(room - 1, 0)].rstrip() + "…"
+        return title + tail
 
     @staticmethod
     def _turned_down_note(prefix: str, turned_down: dict[str, str]) -> str:
