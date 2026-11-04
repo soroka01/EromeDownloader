@@ -2,7 +2,7 @@ import hashlib
 import re
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import ParseResult, unquote, urlparse, urlunparse
 
 from erome.config import (
     ACCOUNT_EXCLUDED_PATHS,
@@ -14,6 +14,14 @@ from erome.config import (
     SORT_ALBUMS_BY_SIZE,
 )
 from erome.models import AlbumData, FileJob, LinkKind
+
+
+def safe_urlparse(url: str) -> ParseResult:
+    """`urlparse` that takes a broken address (for example "http://[x") for no address at all, not for an error."""
+    try:
+        return urlparse(url)
+    except ValueError:
+        return ParseResult("", "", "", "", "", "")
 
 
 def clean_queue_links(links: Iterable[str]) -> list[str]:
@@ -102,29 +110,32 @@ def dedupe_preserve_order(items: Iterable[str]) -> list[str]:
 
 
 def is_erome_album_url(url: str) -> bool:
-    parsed = urlparse(clean_input_url(url))
+    parsed = safe_urlparse(clean_input_url(url))
     host = (parsed.hostname or "").lower()
     return host in EROME_HOSTS and parsed.path.startswith("/a/")
 
 
+# Sections of the site that are not profiles. The entries of the config lists that end with "/" only ever matched
+# deeper paths, and those are not profiles anyway, so a profile named "user" stays a profile.
+_RESERVED_ACCOUNT_NAMES = frozenset(
+    entry.strip("/") for entry in (*ACCOUNT_EXCLUDED_PREFIXES, *ACCOUNT_EXCLUDED_PATHS) if not entry.endswith("/")
+)
+
+
 def is_erome_account_url(url: str) -> bool:
-    parsed = urlparse(clean_input_url(url))
+    parsed = safe_urlparse(clean_input_url(url))
     host = (parsed.hostname or "").lower()
-    path = parsed.path.rstrip("/")
-    if host not in EROME_HOSTS or not path or path == "/":
+    path = parsed.path.strip("/")
+    if host not in EROME_HOSTS or not path or "/" in path:
         return False
-    if path in ACCOUNT_EXCLUDED_PATHS:
-        return False
-    if any(path.startswith(prefix) for prefix in ACCOUNT_EXCLUDED_PREFIXES):
-        return False
-    return "/" not in path.strip("/")
+    return path not in _RESERVED_ACCOUNT_NAMES
 
 
 def normalize_account_url(url: str) -> str:
     url = clean_input_url(url)
-    parsed = urlparse(url)
+    parsed = safe_urlparse(url)
     if not parsed.scheme:
-        parsed = urlparse(f"https://{url}")
+        parsed = safe_urlparse(f"https://{url}")
 
     host = (parsed.hostname or "").lower()
     if host not in EROME_HOSTS:
@@ -154,7 +165,7 @@ def link_kind(url: str) -> LinkKind:
 
 def download_sort_key(url: str) -> tuple[int, str, str]:
     kind_order = {LinkKind.DIRECT: 0, LinkKind.ALBUM: 1, LinkKind.ACCOUNT: 2}
-    parsed = urlparse(url)
+    parsed = safe_urlparse(url)
     return (
         kind_order.get(link_kind(url), 99),
         (parsed.hostname or "").lower(),
@@ -232,7 +243,7 @@ def is_finished_download_url(url: str, ready_urls: set[str], banned_urls: set[st
 
 
 def account_name_from_url(url: str) -> str:
-    parsed = urlparse(normalize_account_url(url))
+    parsed = safe_urlparse(normalize_account_url(url))
     name = unquote(parsed.path.strip("/").split("/", 1)[0])
     return safe_name(name, default="account")
 
@@ -245,7 +256,7 @@ def account_page_url(account_url: str, page: int) -> str:
 
 
 def safe_file_name_from_url(url: str, fallback_prefix: str = "file") -> str:
-    parsed = urlparse(url)
+    parsed = safe_urlparse(url)
     file_name = unquote(Path(parsed.path).name)
     if not file_name:
         digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]

@@ -79,7 +79,7 @@ class DownloadSummary:
             return Outcome.FAILED
         if self.failed_count == 0 and self.banned_count == 0:
             return Outcome.SUCCESS
-        if self.ok_count == 0 and self.banned_count > 0:
+        if self.ok_count == 0 and self.failed_count == 0 and self.banned_count > 0:
             return Outcome.BANNED
         return Outcome.FAILED
 
@@ -117,7 +117,11 @@ class AlbumData:
 
 
 class DownloadError(Exception):
-    pass
+    """A failure that may pass on a repeat; `retry_after` is the pause in seconds the server asked for, if any."""
+
+    def __init__(self, message: str = "", *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class AlbumFetchError(Exception):

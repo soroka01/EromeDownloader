@@ -1,12 +1,13 @@
 import asyncio
+import random
 import re
 from contextlib import nullcontext
-from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urljoin, urlparse
+from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from erome.config import (
     ACCOUNT_MAX_PAGES,
@@ -26,10 +27,13 @@ from erome.config import (
 from erome.console import (
     LiveProgress,
     friendly_error,
+    log_error,
     log_hint,
+    log_retry,
     log_retry_unless_quiet,
     log_warn,
     short_url,
+    stop_requested,
 )
 from erome.models import AlbumData, AlbumFetchError, DownloadError, DownloadResultCallback, Outcome
 from erome.ui import human_size
@@ -46,6 +50,12 @@ from erome.urls import (
 
 
 PAGE_GONE_STATUSES = frozenset({404, 410})  # a later page of a profile that answers 403 is throttled, not gone
+
+
+SITE_URL = "https://www.erome.com/"
+
+
+MAX_RETRY_AFTER = 60.0  # the longest pause a server's Retry-After is allowed to ask for, in seconds
 
 
 def make_session(
@@ -73,10 +83,10 @@ async def drain_tasks(
     on_result: Callable[[Any], None] | None = None,
     progress: LiveProgress | None = None,
 ) -> None:
-    """Wait for the tasks as they finish; whatever the outcome, the ones still running are cancelled in the end."""
+    """Wait for the tasks as they finish; whatever the outcome, the ones still running are cancelled and awaited."""
     try:
-        for task in asyncio.as_completed(tasks):
-            result = await task
+        for finishing in asyncio.as_completed(tasks):
+            result = await finishing
             if on_result:
                 on_result(result)
             if progress is not None:
@@ -84,13 +94,32 @@ async def drain_tasks(
     finally:
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def optional_progress(enabled: bool, **kwargs):
+def optional_progress(enabled: bool, **kwargs: Any) -> LiveProgress | nullcontext[None]:
     return LiveProgress(**kwargs) if enabled else nullcontext()
 
 
-def parse_content_length(headers) -> int:
+def retry_delay(attempt: int, cap: float, retry_after: float | None = None) -> float:
+    """Pause before the next try: 1, 2, 4... seconds up to `cap`, +-25% so that parallel retries do not meet again
+    at the same instant; a pause the server asked for (Retry-After, at most MAX_RETRY_AFTER) is never shortened."""
+    delay = min(2 ** (attempt - 1), cap) * random.uniform(0.75, 1.25)
+    if retry_after is not None:
+        return max(delay, min(retry_after, MAX_RETRY_AFTER))
+    return delay
+
+
+def parse_retry_after(headers: Mapping[str, str]) -> float | None:
+    """The Retry-After header in seconds; a date or anything else that is not a number of seconds gives None."""
+    try:
+        seconds = float(headers.get("Retry-After", ""))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def parse_content_length(headers: Mapping[str, str]) -> int:
     try:
         return int(headers.get("Content-Length", 0) or 0)
     except (TypeError, ValueError, AttributeError):
@@ -104,6 +133,40 @@ def parse_content_range_total(value: str | None) -> int:
     if not match or match.group(1) == "*":
         return 0
     return int(match.group(1))
+
+
+def parse_content_range_start(value: str | None) -> int | None:
+    """The first byte of "bytes 100-199/1000"; None when the header is missing or not a byte range."""
+    match = re.match(r"\s*bytes\s+(\d+)\s*-", value or "", re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+async def wait_for_site(max_wait: float = 180.0) -> None:
+    """After a failed pass: wait until the site answers again (a network outage), but not longer than `max_wait`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_wait
+    pause = 5.0
+    announced = False
+    while not stop_requested():
+        if await _site_answers():
+            return
+        if not announced:
+            log_retry(f"Нет связи с сайтом, жду до {max_wait:.0f} с…")
+            announced = True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(pause, remaining))
+        pause = min(pause * 1.5, 30.0)
+
+
+async def _site_answers() -> bool:
+    timeout = ClientTimeout(total=10, connect=5, sock_connect=5, sock_read=10)
+    try:
+        async with make_session(1, timeout=timeout) as session, session.get(SITE_URL) as response:
+            return response.status < 500
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return False
 
 
 async def _probe_media_size(
@@ -250,6 +313,12 @@ async def estimate_album_sizes_batch(
         )
 
 
+def _attribute(tag: Tag, name: str) -> str:
+    """An attribute of a tag as plain text; "" when it is missing or has several values (a class list)."""
+    value = tag.get(name)
+    return value if isinstance(value, str) else ""
+
+
 def parse_account_html(
     html_content: str,
     base_url: str,
@@ -258,10 +327,10 @@ def parse_account_html(
     soup = BeautifulSoup(html_content, "html.parser")
     album_urls: list[str] = []
     page_numbers: set[int] = {1}
-    account_path = urlparse(normalize_account_url(account_url)).path.rstrip("/")
+    account_path = unquote(urlparse(normalize_account_url(account_url)).path).rstrip("/").casefold()
 
     for link in soup.find_all("a", href=True):
-        absolute_url = urljoin(base_url, link["href"])
+        absolute_url = urljoin(base_url, _attribute(link, "href"))
         parsed = urlparse(absolute_url)
         host = (parsed.hostname or "").lower()
 
@@ -269,7 +338,7 @@ def parse_account_html(
             album_urls.append(normalize_album_url(absolute_url))
             continue
 
-        if host in EROME_HOSTS and parsed.path.rstrip("/") == account_path:
+        if host in EROME_HOSTS and unquote(parsed.path).rstrip("/").casefold() == account_path:
             for value in parse_qs(parsed.query).get("page", []):
                 try:
                     page_number = int(value)
@@ -288,15 +357,18 @@ async def _fetch_text_page(
     session: aiohttp.ClientSession,
     url: str,
     label: str,
+    gate: asyncio.Semaphore | None = None,
 ) -> str:
+    """Text of a page. `gate`, sized like the session's pool, is held only while a request is in flight: aiohttp counts
+    the wait for a free connection against the connect timeout, so tasks queueing in the pool would time out."""
     last_error = ""
     for attempt in range(1, PAGE_ATTEMPTS + 1):
         try:
-            async with session.get(url) as response:
+            async with gate or nullcontext(), session.get(url) as response:
                 if response.status in UNAVAILABLE_STATUSES:
                     raise AlbumFetchError(f"HTTP {response.status}", response.status)
                 if response.status in RETRYABLE_STATUSES:
-                    raise DownloadError(f"HTTP {response.status}")
+                    raise DownloadError(f"HTTP {response.status}", retry_after=parse_retry_after(response.headers))
                 if not response.ok:
                     raise AlbumFetchError(f"HTTP {response.status}", response.status)
                 return await response.text(errors="replace")
@@ -305,10 +377,10 @@ async def _fetch_text_page(
         except (aiohttp.ClientError, asyncio.TimeoutError, DownloadError) as error:
             last_error = str(error) or error.__class__.__name__
             if attempt < PAGE_ATTEMPTS:
-                delay = min(2 ** (attempt - 1), 8)
+                delay = retry_delay(attempt, 8, error.retry_after if isinstance(error, DownloadError) else None)
                 log_retry_unless_quiet(
                     f"{label}: {friendly_error(last_error)} "
-                    f"({attempt}/{PAGE_ATTEMPTS}), пауза {delay}s",
+                    f"({attempt}/{PAGE_ATTEMPTS}), пауза {delay:.1f}s",
                     last_error,
                 )
                 await asyncio.sleep(delay)
@@ -320,16 +392,19 @@ async def _collect_account_page_albums(
     session: aiohttp.ClientSession,
     page_url: str,
     account_url: str,
+    gate: asyncio.Semaphore,
 ) -> tuple[str, list[str]] | AlbumFetchError:
     try:
-        html_content = await _fetch_text_page(session, page_url, "account page")
+        html_content = await _fetch_text_page(session, page_url, "account page", gate)
+        page_albums, _ = parse_account_html(
+            html_content,
+            base_url=page_url,
+            account_url=account_url,
+        )
     except AlbumFetchError as error:
         return error
-    page_albums, _ = parse_account_html(
-        html_content,
-        base_url=page_url,
-        account_url=account_url,
-    )
+    except Exception as error:  # a page that cannot be parsed is an unread page, not a reason to drop the whole batch
+        return AlbumFetchError(f"{type(error).__name__}: {error}")
     return page_url, page_albums
 
 
@@ -338,8 +413,9 @@ async def _collect_album_data_with_session(
     url: str,
     skip_videos: bool,
     skip_images: bool,
+    gate: asyncio.Semaphore | None = None,
 ) -> AlbumData:
-    html_content = await _fetch_text_page(session, url, "album page")
+    html_content = await _fetch_text_page(session, url, "album page", gate)
     return parse_album_html_data(
         html_content,
         base_url=url,
@@ -365,6 +441,9 @@ async def collect_album_data_batch(
     albums: list[AlbumData] = []
     failures: list[tuple[str, Outcome]] = []
 
+    connections = min(ALBUM_PREFETCH_CONNECTIONS, len(album_urls))
+    gate = asyncio.Semaphore(connections)
+
     async def collect_one(url: str) -> tuple[str, AlbumData | None, Outcome | None]:
         try:
             album_data = await _collect_album_data_with_session(
@@ -372,10 +451,14 @@ async def collect_album_data_batch(
                 url,
                 skip_videos,
                 skip_images,
+                gate,
             )
             return url, album_data, None
         except AlbumFetchError as error:
             return url, None, error.outcome
+        except Exception as error:  # one album that cannot be read must not stop the whole batch
+            log_error(f"{short_url(url)}: {type(error).__name__}: {friendly_error(error)}")
+            return url, None, Outcome.FAILED
 
     def on_scanned(item: tuple[str, AlbumData | None, Outcome | None]) -> None:
         url, album_data, status = item
@@ -386,7 +469,7 @@ async def collect_album_data_batch(
             if result_callback:
                 result_callback(url, status)
 
-    async with make_session(min(ALBUM_PREFETCH_CONNECTIONS, len(album_urls))) as session:
+    async with make_session(connections) as session:
         tasks = [asyncio.create_task(collect_one(url)) for url in album_urls]
         with optional_progress(
             show_progress,
@@ -435,15 +518,16 @@ async def collect_album_data_batch(
 async def collect_account_album_urls(account_url: str, show_progress: bool = True) -> list[str]:
     """Album links of a profile in page order (as listed on the site, newest first)."""
     account_url = normalize_account_url(account_url)
+    gate = asyncio.Semaphore(ACCOUNT_PAGE_CONNECTIONS)
     async with make_session(ACCOUNT_PAGE_CONNECTIONS) as session:
-        first_html = await _fetch_text_page(session, account_url, "account page")
+        first_html = await _fetch_text_page(session, account_url, "account page", gate)
         album_urls, page_numbers = parse_account_html(
             first_html,
             base_url=account_url,
             account_url=account_url,
         )
 
-        max_page = max(page_numbers) if page_numbers else 1
+        max_page = max(page_numbers)
         if max_page > ACCOUNT_MAX_PAGES:
             log_warn(
                 f"{short_url(account_url)}: страниц больше {ACCOUNT_MAX_PAGES}, "
@@ -457,7 +541,7 @@ async def collect_account_album_urls(account_url: str, show_progress: bool = Tru
 
         tasks = [
             asyncio.create_task(
-                _collect_account_page_albums(session, page_url, account_url)
+                _collect_account_page_albums(session, page_url, account_url, gate)
             )
             for page_url in page_urls
         ]
@@ -512,22 +596,22 @@ def parse_album_html_data(
     soup = BeautifulSoup(html_content, "html.parser")
 
     meta_title = soup.find("meta", property="og:title")
-    if meta_title and meta_title.has_attr("content"):
-        album_title = safe_name(meta_title["content"])
-    else:
-        album_title = safe_name("temp")
+    title = _attribute(meta_title, "content") if isinstance(meta_title, Tag) else ""
+    if not title:
+        log_warn(f"{short_url(album_url)}: у страницы нет названия (og:title), папка будет называться temp")
+    album_title = safe_name(title)
 
     video_urls: list[str] = []
     if not skip_videos:
         for video_source in soup.find_all("source"):
-            src = video_source.get("src")
+            src = _attribute(video_source, "src")
             if src:
                 video_urls.append(urljoin(base_url, src))
 
     image_urls: list[str] = []
     if not skip_images:
         for image in soup.find_all("img", {"class": "img-back"}):
-            data_src = image.get("data-src") or image.get("src")
+            data_src = _attribute(image, "data-src") or _attribute(image, "src")
             if data_src:
                 image_urls.append(urljoin(base_url, data_src))
 

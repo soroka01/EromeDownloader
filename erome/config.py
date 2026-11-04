@@ -2,6 +2,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from erome.ui import ui
 
@@ -18,7 +19,7 @@ LINKS_DIR = BASE_DIR / "links"
 CONFIG_PATH = BASE_DIR / "config.json"
 
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "max_connections": 6,
     "min_connections_per_parallel_album": 3,
     "max_parallel_albums": 3,
@@ -57,7 +58,7 @@ def load_config() -> dict:
         return DEFAULT_CONFIG.copy()
 
     try:
-        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as error:
         _warn(f"config.json не читается: {error}. Использую настройки по умолчанию.")
         return DEFAULT_CONFIG.copy()
@@ -208,7 +209,7 @@ SKIP_IMAGES = _bool_setting("skip_images")
 MANIFEST_PATH = _path_setting("manifest_path")
 
 
-RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504, 522, 524}
+RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
 
 UNAVAILABLE_STATUSES = {403, 404, 410}

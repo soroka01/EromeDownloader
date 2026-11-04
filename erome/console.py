@@ -8,11 +8,12 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
 
 from erome.config import MAX_LOG_MESSAGE, RETRYABLE_STATUSES
 from erome.models import Outcome
 from erome.ui import BAR_WIDTH, human_duration, human_size, ui
+from erome.urls import safe_urlparse
 
 
 def configure_console() -> None:
@@ -58,7 +59,7 @@ def shorten_text(value: object, limit: int = 120) -> str:
 
 
 def short_url(url: str, limit: int = 110) -> str:
-    parsed = urlparse(url)
+    parsed = safe_urlparse(url)
     if parsed.scheme and parsed.netloc:
         path = unquote(parsed.path.rstrip("/"))
         tail = Path(path).name
@@ -256,7 +257,8 @@ class LiveProgress:
     async def _tick(self) -> None:
         while True:
             await asyncio.sleep(0.5)
-            self._draw()
+            with suppress(Exception):  # a failing redraw skips this tick, the line must keep updating
+                self._draw()
 
     # ----- context manager
 

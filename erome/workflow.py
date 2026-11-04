@@ -1,4 +1,6 @@
 import asyncio
+import traceback
+from pathlib import Path
 from typing import Awaitable, Callable, Iterable
 
 from erome.config import DOWNLOADS_DIR, SORT_ALBUMS_BY_SIZE
@@ -33,6 +35,8 @@ from erome.net import (
     collect_account_album_urls,
     collect_album_data,
     collect_album_data_batch,
+    drain_tasks,
+    wait_for_site,
 )
 from erome.storage import (
     PendingQueue,
@@ -50,6 +54,7 @@ from erome.urls import (
     account_name_from_url,
     build_download_jobs,
     choose_parallel_album_count,
+    clean_queue_links,
     is_erome_account_url,
     is_erome_album_url,
     is_finished_download_url,
@@ -67,8 +72,22 @@ def unexpected_failure(url: str, error: Exception) -> Outcome:
     """Log an error that no handler expected and return the result status of the failed item."""
     detail = friendly_error(error)
     name = type(error).__name__
-    log_error(f"{short_url(url)}: {detail if detail.startswith(name) else f'{name}: {detail}'}")
+    frames = traceback.extract_tb(error.__traceback__)
+    where = f" [{Path(frames[-1].filename).name}:{frames[-1].lineno}]" if frames else ""
+    log_error(f"{short_url(url)}: {detail if detail.startswith(name) else f'{name}: {detail}'}{where}")
     return Outcome.FAILED
+
+
+def prepare_accounts(links: Iterable[str]) -> list[str]:
+    """Profile links from accs.txt; the lines that are not profile links are skipped, with one warning."""
+    lines = clean_queue_links(links)
+    skipped = [line for line in lines if not is_erome_account_url(normalize_download_url(line))]
+    if skipped:
+        log_warn(
+            f"accs.txt: пропущено строк, не похожих на ссылку на профиль: {len(skipped)} "
+            f"(первая: {short_url(skipped[0])})"
+        )
+    return prepare_account_links(lines)
 
 
 async def download_link(
@@ -206,9 +225,11 @@ async def run_with_retry(
 
     if failed and not stop_requested():
         log_retry(retry_message(len(failed)))
-        retry_results = await run(failed, retry_label, final_callback)
-        banned += [url for url, result in retry_results if result == Outcome.BANNED]
-        failed = [url for url, result in retry_results if result == Outcome.FAILED]
+        await wait_for_site()  # the failures may be a network outage: do not spend the last pass on it
+        if not stop_requested():
+            retry_results = await run(failed, retry_label, final_callback)
+            banned += [url for url, result in retry_results if result == Outcome.BANNED]
+            failed = [url for url, result in retry_results if result == Outcome.FAILED]
 
     return banned, failed
 
@@ -351,25 +372,28 @@ async def run_group[T](
 
     results: list[tuple[str, Outcome]] = []
 
+    def notify(url: str, call: Callable[[], None]) -> None:
+        try:
+            call()
+        except Exception as error:  # a failing record must not leave the other items running unattended
+            unexpected_failure(url, error)
+
     def accept(outcome: tuple[str, Outcome]) -> None:
         url, status = outcome
         if status == Outcome.STOPPED:
             return  # not started: stays in the queue for the next run
         results.append(outcome)
         if result_callback:
-            result_callback(url, status)
+            notify(url, lambda: result_callback(url, status))
         if on_result:
-            on_result(url)
+            notify(url, lambda: on_result(url))
 
     tasks = [asyncio.create_task(run_one(index, item)) for index, item in enumerate(items, 1)]
     if single:
-        for task in asyncio.as_completed(tasks):
-            accept(await task)
+        await drain_tasks(tasks, accept)
     else:
         with progress:
-            for task in asyncio.as_completed(tasks):
-                accept(await task)
-                progress.update(1)
+            await drain_tasks(tasks, accept, progress)
     log_result_summary(label, results)
     return results
 
@@ -694,7 +718,7 @@ async def batch_download_accounts(
     skip_images: bool,
     sort_links: bool,
 ) -> None:
-    account_links = prepare_account_links(links)
+    account_links = prepare_accounts(links)
 
     if sort_links:
         account_links = sort_download_links(account_links)
@@ -723,7 +747,7 @@ async def scan_accounts_to_pending(
     links: Iterable[str],
     sort_links: bool,
 ) -> None:
-    account_links = prepare_account_links(links)
+    account_links = prepare_accounts(links)
     if sort_links:
         account_links = sort_download_links(account_links)
 
@@ -757,6 +781,12 @@ async def scan_accounts_to_pending(
             unexpected_failure(account_url, error)
             set_account_status(account_url, "failed")
             record_account_manifest(account_url, "failed")
+            continue
+
+        if not album_urls:
+            log_warn(f"{account_name}: посты не найдены")
+            set_account_status(account_url, "failed")
+            record_account_manifest(account_url, "failed", found=0)
             continue
 
         known_urls = ready_urls | banned_urls | failed_urls | pending_urls

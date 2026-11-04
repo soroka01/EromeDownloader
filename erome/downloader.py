@@ -1,5 +1,4 @@
 import asyncio
-import time
 from pathlib import Path
 from typing import Callable
 
@@ -8,7 +7,6 @@ import aiohttp
 
 from erome.config import (
     CHUNK_SIZE,
-    IDLE_TIMEOUT,
     MAX_ATTEMPTS,
     RETRYABLE_STATUSES,
     UNAVAILABLE_STATUSES,
@@ -36,7 +34,10 @@ from erome.net import (
     make_session,
     optional_progress,
     parse_content_length,
+    parse_content_range_start,
     parse_content_range_total,
+    parse_retry_after,
+    retry_delay,
 )
 from erome.manifest import record_file_results
 from erome.storage import ensure_runtime_dirs
@@ -130,6 +131,13 @@ async def download_jobs(
     return summary
 
 
+MAX_PASS_FACTOR = 25  # passes that made progress do not count as attempts, but their number is capped all the same
+
+
+def _part_size(part_path: Path) -> int:
+    return part_path.stat().st_size if part_path.exists() else 0
+
+
 async def _download_file(
     session: aiohttp.ClientSession,
     job: FileJob,
@@ -139,31 +147,42 @@ async def _download_file(
 ) -> DownloadResult:
     part_path = job.path.with_name(job.path.name + ".part")
     last_error = ""
+    passes = 0
+    failures = 0  # passes that brought no new data; a pass that did is not held against the file
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    while True:
+        passes += 1
+        size_before = _part_size(part_path)
+        retry_after: float | None = None
         try:
             async with semaphore:
                 return await _download_file_once(
                     session,
                     job,
                     part_path,
-                    attempt,
+                    passes,
                     show_messages=show_messages,
                     byte_progress=byte_progress,
                 )
         except DownloadError as error:
             last_error = str(error)
+            retry_after = error.retry_after
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
             last_error = str(error) or error.__class__.__name__
 
-        if attempt < MAX_ATTEMPTS:
-            delay = min(2 ** (attempt - 1), 12)
-            log_retry_unless_quiet(
-                f"{job.path.name}: {friendly_error(last_error)} "
-                f"({attempt}/{MAX_ATTEMPTS}), пауза {delay}s",
-                last_error,
-            )
-            await asyncio.sleep(delay)
+        size_after = _part_size(part_path)
+        if size_after <= size_before:
+            failures += 1
+        if failures >= MAX_ATTEMPTS or passes >= MAX_ATTEMPTS * MAX_PASS_FACTOR:
+            break
+
+        delay = retry_delay(max(failures, 1), 12, retry_after)
+        log_retry_unless_quiet(
+            f"{job.path.name}: {friendly_error(last_error)} "
+            f"({failures}/{MAX_ATTEMPTS}{', докачка идёт' if size_after > size_before else ''}), пауза {delay:.1f}s",
+            last_error,
+        )
+        await asyncio.sleep(delay)
 
     if show_messages and not is_quiet_retry_error(last_error):
         log_error(f"{short_url(job.url)}: {friendly_error(last_error)}")
@@ -172,7 +191,7 @@ async def _download_file(
         status=Outcome.FAILED,
         path=job.path,
         error=last_error,
-        attempts=MAX_ATTEMPTS,
+        attempts=passes,
     )
 
 
@@ -184,7 +203,7 @@ async def _download_file_once(
     show_messages: bool,
     byte_progress: Callable[[int], None] | None,
 ) -> DownloadResult:
-    resume_from = part_path.stat().st_size if part_path.exists() else 0
+    resume_from = _part_size(part_path)
     request_headers = {}
     if resume_from:
         request_headers["Range"] = f"bytes={resume_from}-"
@@ -218,7 +237,7 @@ async def _download_file_once(
             raise DownloadError("сервер отклонил докачку, начинаю заново")
 
         if response.status in RETRYABLE_STATUSES:
-            raise DownloadError(f"HTTP {response.status}")
+            raise DownloadError(f"HTTP {response.status}", retry_after=parse_retry_after(response.headers))
 
         if not response.ok and response.status != 206:
             return DownloadResult(
@@ -229,10 +248,16 @@ async def _download_file_once(
                 attempts=attempt,
             )
 
+        if response.headers.get("Content-Type", "").lower().startswith("text/html"):
+            raise DownloadError("вместо файла пришла страница")
+
         remote_total = parse_content_range_total(response.headers.get("Content-Range"))
         content_length = parse_content_length(response.headers)
 
         if resume_from and response.status == 206:
+            if parse_content_range_start(response.headers.get("Content-Range")) != resume_from:
+                part_path.unlink()
+                raise DownloadError("сервер отдал не тот фрагмент, начинаю заново")
             mode = "ab"
             total_size = remote_total or resume_from + content_length
         else:
@@ -255,20 +280,15 @@ async def _download_file_once(
                 size_bytes=total_size,
             )
 
-        last_data_time = time.monotonic()
         async with aiofiles.open(part_path, mode) as file:
             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                now = time.monotonic()
-                if now - last_data_time > IDLE_TIMEOUT:
-                    raise asyncio.TimeoutError("нет данных слишком долго")
-                if not chunk:
-                    continue
                 await file.write(chunk)
-                last_data_time = now
                 if byte_progress is not None:
                     byte_progress(len(chunk))
 
-        downloaded_size = part_path.stat().st_size if part_path.exists() else 0
+        downloaded_size = _part_size(part_path)
+        if downloaded_size == 0:
+            raise DownloadError("пустой ответ")
         if total_size and downloaded_size < total_size:
             raise DownloadError(
                 f"файл неполный: {downloaded_size}/{total_size} байт"

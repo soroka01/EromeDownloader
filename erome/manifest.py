@@ -23,12 +23,9 @@ def now_iso() -> str:
 def format_bytes(size: int | float) -> str:
     """Size as the manifest writes it ("12.34 MB"). The strings are part of the file format: do not swap in ui.human_size."""
     size = float(size or 0)
-    units = ("B", "KB", "MB", "GB", "TB")
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(size)} {unit}"
-            return f"{size:.2f} {unit}"
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} B" if unit == "B" else f"{size:.2f} {unit}"
         size /= 1024
     return f"{size:.2f} TB"
 
@@ -136,7 +133,7 @@ class ManifestStore:
                 json.dumps(self._data, ensure_ascii=False, indent=2) + "\n",
                 durable=True,
             )
-        except OSError as error:
+        except (OSError, ValueError, TypeError) as error:
             if not self._write_failed:
                 log_warn(f"Не удалось записать манифест ({error}); загрузки продолжаются, повторю позже")
             self._write_failed = True

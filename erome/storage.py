@@ -1,9 +1,11 @@
 """Files under links/ that the console modes work with: the status lists (pending, ready, failed, ...)."""
 import os
+import time
 from pathlib import Path
 from typing import Callable, Iterable
 
 from erome.config import ACCOUNT_STATUS_FILES, DOWNLOADS_DIR, LINKS_DIR, STATUS_FILES
+from erome.console import log_warn
 from erome.models import DownloadResultCallback, Outcome
 from erome.urls import (
     canonical_status_link,
@@ -25,25 +27,50 @@ def status_file_path(name: str) -> Path:
 
 
 def read_clean_lines(path: Path) -> list[str]:
+    """Non-empty stripped lines of a text file; a BOM is skipped and an unreadable byte never stops the program."""
     if not path.exists():
         return []
     return [
         line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
+        for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
         if line.strip()
     ]
 
 
+LOCK_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8)  # seconds between the 6 attempts to write or replace a busy file
+WINDOWS_BUSY_FILE_ERRORS = (5, 32, 33)  # access denied, sharing violation, lock violation
+
+
+def _retry_busy_file[T](action: Callable[[], T]) -> T:
+    """Run a file operation again when Windows says the file is busy (antivirus, indexer, editor); then re-raise."""
+    for delay in LOCK_RETRY_DELAYS:
+        try:
+            return action()
+        except OSError as error:
+            busy = isinstance(error, PermissionError) or getattr(error, "winerror", None) in WINDOWS_BUSY_FILE_ERRORS
+            if not busy:
+                raise
+        time.sleep(delay)
+    return action()
+
+
 def write_text_atomic(path: Path, text: str, durable: bool = False) -> None:
-    """Write via a temporary file and a rename; `durable` also forces the data to disk before the rename."""
+    """Write via a temporary file and a rename; `durable` also forces the data to disk before the rename.
+
+    A file that is busy for a moment is retried for about 1.6 seconds in all; the last error is raised after that.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(path.name + ".tmp")
-    with temp_path.open("w", encoding="utf-8") as file:
-        file.write(text)
-        if durable:
-            file.flush()
-            os.fsync(file.fileno())
-    temp_path.replace(path)
+
+    def write_temp() -> None:
+        with temp_path.open("w", encoding="utf-8") as file:
+            file.write(text)
+            if durable:
+                file.flush()
+                os.fsync(file.fileno())
+
+    _retry_busy_file(write_temp)
+    _retry_busy_file(lambda: temp_path.replace(path))
 
 
 _queue_cache: dict[str, dict[str, None]] = {}
@@ -66,12 +93,24 @@ def _queue_entries(name: str) -> dict[str, None]:
     return entries
 
 
+_failed_flushes: set[str] = set()  # queues whose last write failed: the warning is shown once per failure streak
+
+
 def _flush_queue(name: str) -> None:
+    """Write the queue to its file. Memory stays authoritative: a file that stays busy only costs a warning,
+    and the next change writes it again."""
     links = list(_queue_entries(name))
-    write_text_atomic(
-        status_file_path(name),
-        "\n".join(links) + ("\n" if links else ""),
-    )
+    try:
+        write_text_atomic(
+            status_file_path(name),
+            "\n".join(links) + ("\n" if links else ""),
+        )
+    except OSError as error:
+        if name not in _failed_flushes:
+            log_warn(f"links/{name}.txt не записан ({error}); продолжаю, файл обновится при следующем изменении")
+        _failed_flushes.add(name)
+    else:
+        _failed_flushes.discard(name)
 
 
 def write_queue(name: str, links: Iterable[str]) -> None:
@@ -151,14 +190,24 @@ def append_pending_links(links: Iterable[str]) -> int:
 class PendingQueue:
     def __init__(self, links: Iterable[str]):
         self.remaining: dict[str, None] = dict.fromkeys(normalize_download_url(link) for link in clean_queue_links(links))
+        # The line each remaining link is written as, worked out once: the file is rewritten after every finished link
+        self._lines: dict[str, str | None] = {link: self._file_line(link) for link in self.remaining}
+
+    @staticmethod
+    def _file_line(link: str) -> str | None:
+        """What write_queue would make of the link; None when it would drop it."""
+        cleaned = clean_queue_links([link])
+        return canonical_status_link(cleaned[0]) if cleaned else None
 
     def flush(self) -> None:
-        write_pending(self.remaining)
+        _queue_cache["pending"] = dict.fromkeys(line for line in self._lines.values() if line is not None)
+        _flush_queue("pending")
 
     def remove(self, url: str) -> None:
         normalized = normalize_download_url(url)
         if normalized in self.remaining:
             del self.remaining[normalized]
+            del self._lines[normalized]
             self.flush()
 
 
