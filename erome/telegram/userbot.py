@@ -2,7 +2,7 @@
 
 Photos and videos go out as albums (media groups of up to 10), anything else as single messages. Every message
 uses a deterministic random_id, so repeating a batch after a lost answer or a restart can never post a file twice.
-The connection itself (supervisor, deadlines, upload connections, sign-in) lives in tg_transport.py.
+The connection itself (supervisor, deadlines, upload connections, sign-in) lives in transport.py.
 """
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from typing import Any, Callable
 
 from telethon import TelegramClient, errors, functions, types, utils
 
-from erome.tg_media import SendItem
-from erome.tg_transport import (
+from erome.telegram.media import SendItem
+from erome.telegram.transport import (
     BIG_FILE_THRESHOLD_BYTES,
     REQUEST_TIMEOUT_SECONDS,
     SESSION_ERRORS,

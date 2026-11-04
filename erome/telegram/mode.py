@@ -2,7 +2,7 @@
 
 `serve` starts everything in one event loop: bot polling (aiogram), the userbot connection (Telethon), the job worker,
 the live panels and the console status line; `run_telegram_bot` is the menu entry that prepares settings and sign-in
-first. The bot itself (panel, commands, buttons) is in tg_bot.py.
+first. The bot itself (panel, commands, buttons) is in bot.py.
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ from aiogram.types import BotCommand, User
 from erome.config import BASE_DIR
 from erome.console import RunControl, hotkeys, log, log_error, log_success, log_warn
 from erome.storage import ensure_runtime_dirs
-from erome.tg_bot import BotApp, build_router, count_text
-from erome.tg_pipeline import Pipeline
-from erome.tg_settings import (
+from erome.telegram.bot import BotApp, build_router, count_text
+from erome.telegram.pipeline import Pipeline
+from erome.telegram.settings import (
     SETTINGS_PATH,
     SettingsError,
     TelegramSettings,
@@ -42,9 +42,9 @@ from erome.tg_settings import (
     save_bot_token,
     valid_bot_token,
 )
-from erome.tg_state import TelegramState
-from erome.tg_transport import clean_text, cryptg_available, sign_in_if_needed
-from erome.tg_userbot import Userbot
+from erome.telegram.state import TelegramState
+from erome.telegram.transport import clean_text, cryptg_available, sign_in_if_needed
+from erome.telegram.userbot import Userbot
 from erome.ui import ConsoleHandler, ui
 
 LOG = logging.getLogger("erome.tg")

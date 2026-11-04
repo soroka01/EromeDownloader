@@ -2,7 +2,7 @@
 
 Links are queued durably before the owner's message is deleted, so nothing sent to the bot can get lost. The panel
 is one message per owner that is edited in place; commands and buttons only change the queue and the pause flag.
-Starting and stopping everything is tg_mode.py's business.
+Starting and stopping everything is mode.py's business.
 """
 from __future__ import annotations
 
@@ -29,11 +29,11 @@ from aiogram.types import (
 
 from erome.console import RunControl, log, log_warn
 from erome.models import LinkKind
-from erome.tg_pipeline import Pipeline, Progress
-from erome.tg_settings import TelegramSettings
-from erome.tg_state import CANCELLED, DONE, FAILED, PARTIAL, QUEUED, RUNNING, Job, TelegramState
-from erome.tg_transport import STATE_READY
-from erome.tg_userbot import Userbot
+from erome.telegram.pipeline import Pipeline, Progress
+from erome.telegram.settings import TelegramSettings
+from erome.telegram.state import CANCELLED, DONE, FAILED, PARTIAL, QUEUED, RUNNING, Job, TelegramState
+from erome.telegram.transport import STATE_READY
+from erome.telegram.userbot import Userbot
 from erome.ui import human_duration, human_size, plural
 from erome.urls import account_name_from_url, link_kind, normalize_download_url
 

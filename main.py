@@ -28,7 +28,7 @@ from erome.storage import (
     reset_queue_cache,
     status_file_path,
 )
-from erome.tg_settings import settings_ready
+from erome.telegram.settings import settings_ready
 from erome.ui import plural, ui
 from erome.urls import choose_parallel_album_count
 from erome.workflow import (
@@ -150,7 +150,7 @@ def run_scan() -> None:
 
 def run_telegram() -> bool:
     try:
-        from erome.tg_mode import run_telegram_bot  # on demand: aiogram and Telethon are needed only here
+        from erome.telegram.mode import run_telegram_bot  # on demand: aiogram and Telethon are needed only here
     except ImportError as exc:
         log_error(
             f"Для режима 5 не хватает пакета «{exc.name}». Запустите start.bat "

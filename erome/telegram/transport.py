@@ -2,7 +2,7 @@
 
 `Transport` knows how to stay connected (a supervisor with deadlines on every network step), how to make a request,
 how to move the bytes of a file over several connections and how to sign in by QR code; what is sent and how it is
-arranged into messages is the business of `Userbot` (tg_userbot.py).
+arranged into messages is the business of `Userbot` (userbot.py).
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from telethon import TelegramClient, errors, functions, types, utils
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
 
-from erome.tg_settings import TelegramSettings
+from erome.telegram.settings import TelegramSettings
 
 LOG = logging.getLogger("erome.tg")
 _LANE_LOG = logging.getLogger("erome.tg.lane")

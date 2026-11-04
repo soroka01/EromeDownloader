@@ -259,14 +259,15 @@ EromeDownloader/
 │   ├── ui.py              # terminal UI: colours, status line, prompts
 │   ├── urls.py            # URL parsing and sorting
 │   ├── workflow.py        # mode 1-4 workflows
-│   ├── tg_settings.py     # mode 5: telegram.json, token, credentials
-│   ├── tg_state.py        # mode 5: queue and ledger of what was sent
-│   ├── tg_media.py        # mode 5: file kind, video metadata, thumbnails
-│   ├── tg_transport.py    # mode 5: Telethon connection, file uploads, QR sign-in
-│   ├── tg_userbot.py      # mode 5: userbot - albums and messages, what counts as delivered
-│   ├── tg_pipeline.py     # mode 5: download → send
-│   ├── tg_bot.py          # mode 5: bot (aiogram), panel, commands, buttons
-│   └── tg_mode.py         # mode 5: startup - lock, logs, console, all tasks together
+│   └── telegram/          # mode 5: the Telegram bot
+│       ├── settings.py    # telegram.json, token, credentials
+│       ├── state.py       # queue and ledger of what was sent
+│       ├── media.py       # file kind, video metadata, thumbnails
+│       ├── transport.py   # Telethon connection, file uploads, QR sign-in
+│       ├── userbot.py     # userbot - albums and messages, what counts as delivered
+│       ├── pipeline.py    # download → send
+│       ├── bot.py         # bot (aiogram), panel, commands, buttons
+│       └── mode.py        # startup - lock, logs, console, all tasks together
 ├── downloads/             # downloaded files; _telegram/ holds mode 5 scratch files (not in Git)
 ├── links/                 # queues, manifest, tg_queue.json and tg_sent.jsonl (not in Git)
 └── data/                  # Telegram session and mode 5 log (not in Git)
