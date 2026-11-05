@@ -1,30 +1,27 @@
 """The Telegram connection of the Telegram mode: one long-lived Telethon client and everything around it.
 
-`Transport` knows how to stay connected (a supervisor with deadlines on every network step), how to make a request,
-how to move the bytes of a file over several connections and how to sign in by QR code; what is sent and how it is
-arranged into messages is the business of `Userbot` (userbot.py).
+`Transport` knows how to stay connected (a supervisor with deadlines on every network step), how to make a request and
+how to move the bytes of a file over several connections; what is sent and how it is arranged into messages is the
+business of `Userbot` (userbot.py), the first sign-in is signin.py, what a failure means is faults.py.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import copy
-import getpass
-import io
 import logging
 import os
 import random
-import re
 import time
-import unicodedata
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable
 
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.network import MTProtoSender
 from telethon.tl.alltlobjects import LAYER
 
+from erome.telegram.faults import SESSION_ERRORS, RetryLater, UserbotUnavailable, WrongAccount, describe_error
+from erome.telegram.names import display_name
 from erome.telegram.settings import TelegramSettings
 
 LOG = logging.getLogger("erome.tg")
@@ -75,101 +72,6 @@ UPLOAD_CONNECTIONS_GROW_AFTER_SECONDS = 300.0
 UPLOAD_PART_SIZE_BYTES = 512 * 1024
 BIG_FILE_THRESHOLD_BYTES = 10 * 1024 * 1024
 PARALLEL_UPLOAD_MAX_BYTES = 2_000_000_000
-
-
-class UserbotUnavailable(RuntimeError):
-    """Telegram is not connected (yet); nothing was sent."""
-
-
-class RetryLater(RuntimeError):
-    """Telegram asked to wait (flood control); nothing was sent and it is not a failed attempt."""
-
-    def __init__(self, seconds: float, reason: str = "") -> None:
-        super().__init__(reason or f"retry in {seconds:.0f}s")
-        self.seconds = float(seconds)
-
-
-class WrongAccount(ValueError):
-    """The session belongs to another account than the configured one."""
-
-
-SESSION_ERRORS = (
-    errors.AuthKeyDuplicatedError,
-    errors.AuthKeyUnregisteredError,
-    errors.SessionRevokedError,
-    errors.SessionExpiredError,
-    errors.UserDeactivatedError,
-    errors.UserDeactivatedBanError,
-)
-
-
-def error_classes(*names: str) -> tuple[type[BaseException], ...]:
-    """Telethon error classes by name; a name that the installed Telethon does not know is skipped."""
-    return tuple(getattr(errors, name) for name in names if hasattr(errors, name))
-
-
-# Telethon's specific error classes keep only the category in `.message`; the generic one keeps the RPC code there.
-ERROR_CATEGORIES = frozenset(
-    {"BAD_REQUEST", "UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "FLOOD", "INTERNAL", "SEE_OTHER", "NOT_ACCEPTABLE", "ABORTED"}
-)
-_CAUSE_SUFFIX_RE = re.compile(r"\s*\(caused by .*\)\s*$", re.DOTALL)  # greedy: the request in it has brackets of its own
-_WORD_BREAK_RE = re.compile(r"(?<!^)(?=[A-Z])")
-
-
-def error_code(exc: BaseException) -> str:
-    """RPC code of a Telethon error (CHAT_WRITE_FORBIDDEN): a specific class carries it in its name."""
-    message = str(getattr(exc, "message", "") or "")
-    if message and message not in ERROR_CATEGORIES:
-        return message.split(":", 1)[0].strip().upper()
-    name = type(exc).__name__
-    return _WORD_BREAK_RE.sub("_", name.removesuffix("Error")).upper()
-
-
-def describe_error(exc: BaseException) -> str:
-    """One line about a failure for logs: the RPC code of a generic error, else the code and Telethon's description."""
-    message = str(getattr(exc, "message", "") or "")
-    if message and message not in ERROR_CATEGORIES:
-        return message[:160]
-    text = _CAUSE_SUFFIX_RE.sub("", str(exc)).strip() or message
-    if text and isinstance(exc, errors.RPCError):
-        text = f"{error_code(exc)}: {text}"
-    return text[:160] or type(exc).__name__
-
-
-# What the owner reads in the bot panel and in job notes instead of a bare Telegram error code.
-ERROR_TEXTS = {
-    "CHAT_WRITE_FORBIDDEN": "в группу нельзя писать",
-    "CHAT_ADMIN_REQUIRED": "нужны права администратора",
-    "CHAT_RESTRICTED": "группа ограничена для этого аккаунта",
-    "USER_BANNED_IN_CHANNEL": "аккаунт заблокирован в группе",
-    "CHANNEL_PRIVATE": "группа закрыта или аккаунта в ней больше нет",
-    "CHANNEL_INVALID": "группа не найдена",
-    "PEER_ID_INVALID": "группа не найдена",
-    "TOPIC_CLOSED": "тема закрыта",
-    "TOPIC_DELETED": "тема удалена",
-    "CHAT_SEND_MEDIA_FORBIDDEN": "в группе запрещена отправка медиа",
-    "CHAT_SEND_PHOTOS_FORBIDDEN": "в группе запрещена отправка фото",
-    "CHAT_SEND_VIDEOS_FORBIDDEN": "в группе запрещена отправка видео",
-    "CHAT_SEND_DOCS_FORBIDDEN": "в группе запрещена отправка файлов",
-    "CHAT_SEND_GIFS_FORBIDDEN": "в группе запрещена отправка GIF",
-    "CHAT_SEND_PLAIN_FORBIDDEN": "в группе запрещена отправка сообщений",
-    "MEDIA_EMPTY": "Telegram счёл файл пустым или неподдерживаемым",
-    "MEDIA_INVALID": "Telegram не принял файл",
-    "PHOTO_INVALID": "Telegram не принял картинку",
-    "PHOTO_INVALID_DIMENSIONS": "у картинки неподходящие размеры",
-    "PHOTO_SAVE_FILE_INVALID": "Telegram не принял картинку",
-    "PHOTO_EXT_INVALID": "формат картинки не подходит",
-    "IMAGE_PROCESS_FAILED": "Telegram не смог обработать картинку",
-    "FILE_PARTS_INVALID": "файл не загрузился целиком",
-    "FILE_PART_MISSING": "файл не загрузился целиком",
-}
-
-
-def human_error(exc: BaseException) -> str:
-    """`describe_error` for people: a short Russian phrase and the Telegram code in brackets."""
-    code = error_code(exc)
-    text = ERROR_TEXTS.get(code)
-    return f"{text} ({code})" if text else code
 
 
 @dataclass
@@ -281,36 +183,6 @@ def new_client(
         # bare ValueError, and the "already delivered" answer is never seen.
         raise_last_call_error=True,
     )
-
-
-INVISIBLE_CHARS = dict.fromkeys(
-    [0x115F, 0x1160, 0x3164, 0xFFA0, 0x2060, 0xFEFF, *range(0x200B, 0x2010)], None
-)
-DISPLAY_NAME_LIMIT = 40
-# What the legacy Windows console can draw with a predictable cell width: Latin, Greek, Cyrillic, common punctuation.
-RENDERABLE_RANGES = ((0x20, 0x24F), (0x370, 0x52F), (0x1E00, 0x1EFF), (0x2010, 0x2027), (0x2030, 0x205E), (0x20A0, 0x20BF))
-
-
-def clean_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text).translate(INVISIBLE_CHARS)  # fancy letters become plain ones
-    text = " ".join(text.split())
-    text = "".join(ch for ch in text if any(low <= ord(ch) <= high for low, high in RENDERABLE_RANGES))
-    text = " ".join(text.split())
-    return text if len(text) <= DISPLAY_NAME_LIMIT else text[: DISPLAY_NAME_LIMIT - 1] + "…"
-
-
-def display_name(entity: Any) -> str:
-    name = clean_text(
-        " ".join(
-            str(part)
-            for part in (getattr(entity, "first_name", None), getattr(entity, "last_name", None))
-            if part
-        )
-    )
-    username = getattr(entity, "username", None)
-    if name and username:
-        return f"{name} (@{username})"
-    return name or (f"@{username}" if username else str(getattr(entity, "id", "unknown")))
 
 
 class _Unauthorized(Exception):
@@ -840,86 +712,3 @@ class Transport:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)  # let the upload close its file before the caller goes on
             raise
-
-
-# --- first-run sign-in (plain console, before the bot starts) ----------------------------------------------
-
-
-async def _qr_login(client: TelegramClient, say: Callable[[str], None], attempts: int) -> None:
-    import qrcode
-
-    for attempt in range(1, attempts + 1):
-        qr = await client.qr_login()
-        timeout = max(0.0, (qr.expires - datetime.now(timezone.utc)).total_seconds())
-        waiting = asyncio.create_task(qr.wait(timeout=timeout))
-        try:
-            await asyncio.sleep(0)  # let Telethon register its login handler before the code is shown
-            code = qrcode.QRCode(border=2)
-            code.add_data(qr.url)
-            code.make(fit=True)
-            buffer = io.StringIO()
-            code.print_ascii(out=buffer, invert=True)
-            say("")
-            say("Вход в Telegram: Настройки → Устройства → Подключить устройство.")
-            say("Отсканируйте QR-код аккаунтом, с которого пойдёт отправка (Ctrl+C — пропустить). Резервная ссылка:")
-            say(qr.url)
-            say("")
-            for row in buffer.getvalue().splitlines():
-                say(row)
-            await waiting
-            client.session.save()
-            return
-        except (asyncio.TimeoutError, TimeoutError):
-            say(f"Срок действия QR-кода истёк, создаю новый ({attempt}/{attempts}).")
-        except errors.SessionPasswordNeededError:
-            password = await asyncio.to_thread(getpass.getpass, "Облачный пароль Telegram (ввод скрыт): ")
-            await client.sign_in(password=password)
-            client.session.save()
-            return
-        except errors.FloodWaitError as exc:
-            raise RuntimeError(f"Telegram ограничил вход. Подождите {exc.seconds} с.") from exc
-        finally:
-            if not waiting.done():
-                waiting.cancel()
-            await asyncio.gather(waiting, return_exceptions=True)
-    raise RuntimeError("QR-код истёк, попытки закончились.")
-
-
-async def _preflight(settings: TelegramSettings, say: Callable[[str], None], attempts: int) -> str:
-    client = new_client(settings, connection_retries=1, receive_updates=True)
-    try:
-        await asyncio.wait_for(client.connect(), 20)
-        if not await asyncio.wait_for(client.is_user_authorized(), 20):
-            await _qr_login(client, say, attempts)
-        me = await asyncio.wait_for(client.get_me(), 20)
-        if settings.account_id and int(me.id) != settings.account_id:
-            say(f"Вошли под другим аккаунтом: {display_name(me)}. Нужен аккаунт с ID {settings.account_id}.")
-            say("Выхожу из этой сессии, чтобы вы могли войти нужным аккаунтом.")
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.log_out(), 20)
-            raise WrongAccount("вход выполнен не тем аккаунтом")
-        premium = " · Premium" if getattr(me, "premium", False) else " · без Premium"
-        return f"{display_name(me)}{premium}"
-    finally:
-        with contextlib.suppress(Exception):
-            await client.disconnect()
-
-
-def sign_in_if_needed(
-    settings: TelegramSettings,
-    say: Callable[[str], None] = print,
-    *,
-    attempts: int = 10,
-) -> tuple[bool, str]:
-    """Make sure the session is authorized. Returns (signed_in, message); never raises for network or skipped sign-in."""
-    try:
-        name = asyncio.run(_preflight(settings, say, attempts))
-    except KeyboardInterrupt:
-        return False, "вход в Telegram пропущен"
-    except WrongAccount as exc:
-        return False, str(exc)
-    except (OSError, ConnectionError, asyncio.TimeoutError, TimeoutError) as exc:
-        return False, f"нет связи с Telegram ({type(exc).__name__})"
-    except Exception as exc:
-        return False, f"вход в Telegram не выполнен: {exc}"
-    return True, name

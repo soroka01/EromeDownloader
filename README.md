@@ -263,7 +263,10 @@ EromeDownloader/
 │       ├── settings.py    # telegram.json, token, credentials
 │       ├── state.py       # queue and ledger of what was sent
 │       ├── media.py       # file kind, video metadata, thumbnails
-│       ├── transport.py   # Telethon connection, file uploads, QR sign-in
+│       ├── faults.py      # Telegram errors: what each one means, texts for the log and the owner
+│       ├── names.py       # account and group names for the console
+│       ├── transport.py   # Telethon connection, requests, file uploads
+│       ├── signin.py      # first sign-in by QR code
 │       ├── userbot.py     # userbot - albums and messages, what counts as delivered
 │       ├── pipeline.py    # download → send
 │       ├── bot.py         # bot (aiogram), panel, commands, buttons

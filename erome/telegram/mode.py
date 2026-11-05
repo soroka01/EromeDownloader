@@ -30,6 +30,7 @@ from erome.config import BASE_DIR
 from erome.console import RunControl, hotkeys, log, log_error, log_success, log_warn
 from erome.storage import ensure_runtime_dirs
 from erome.telegram.bot import BotApp, build_router, count_text
+from erome.telegram.names import clean_text
 from erome.telegram.pipeline import Pipeline
 from erome.telegram.settings import (
     SETTINGS_PATH,
@@ -43,7 +44,8 @@ from erome.telegram.settings import (
     valid_bot_token,
 )
 from erome.telegram.state import TelegramState
-from erome.telegram.transport import clean_text, cryptg_available, sign_in_if_needed
+from erome.telegram.signin import sign_in_if_needed
+from erome.telegram.transport import cryptg_available
 from erome.telegram.userbot import Userbot
 from erome.ui import ConsoleHandler, ui
 

@@ -14,20 +14,25 @@ from typing import Any, Callable
 
 from telethon import TelegramClient, errors, functions, types, utils
 
-from erome.telegram.media import SendItem
-from erome.telegram.transport import (
-    BIG_FILE_THRESHOLD_BYTES,
-    REQUEST_TIMEOUT_SECONDS,
+from erome.telegram.faults import (
+    PHOTO_ERRORS,
     SESSION_ERRORS,
+    STALE_UPLOAD_ERRORS,
+    TRANSIENT_RPC_ERRORS,
+    DeliveryUncertain,
+    DestinationError,
+    GroupRejected,
+    Refusal,
     RetryLater,
-    Transport,
-    UploadHandle,
     UserbotUnavailable,
     describe_error,
-    error_classes,
     error_code,
     human_error,
+    is_destination_error,
+    is_file_error,
 )
+from erome.telegram.media import SendItem
+from erome.telegram.transport import BIG_FILE_THRESHOLD_BYTES, REQUEST_TIMEOUT_SECONDS, Transport, UploadHandle
 from erome.ui import human_size
 
 LOG = logging.getLogger("erome.tg")
@@ -46,80 +51,11 @@ UPLOAD_REUSE_SECONDS = 1800.0
 SMALL_UPLOAD_CONCURRENCY = 4  # files of up to 10 MB are uploaded this many at a time
 
 
-class DeliveryUncertain(RuntimeError):
-    """The send request may have reached Telegram; repeating it is safe (same random_id)."""
-
-
-class DestinationError(RuntimeError):
-    """The target chat/topic refuses our messages (no rights, closed topic, ...): waiting may fix it, retrying will not."""
-
-
-class GroupRejected(RuntimeError):
-    """Telegram refused the whole album; nothing was posted and the files can still go out one by one."""
-
-    def __init__(self, reason: str, code: str = "", culprit: SendItem | None = None) -> None:
-        super().__init__(reason)
-        self.code = code  # the RPC code of the refusal when there was one (MEDIA_EMPTY, ...)
-        self.culprit = culprit  # the file that was refused when Telegram said which one (the registration of the media)
-
-
-# RPC codes that mean "this chat or topic refuses our messages". Matched by code, not by Telethon's class: the installed
-# Telethon has no class for some of them (CHAT_SEND_DOCS_FORBIDDEN, TOPIC_CLOSED) and raises a generic error instead.
-DESTINATION_CODES = frozenset({
-    "CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED", "USER_BANNED_IN_CHANNEL", "CHANNEL_PRIVATE", "CHANNEL_INVALID",
-    "PEER_ID_INVALID", "TOPIC_DELETED", "TOPIC_CLOSED", "CHAT_RESTRICTED", "USER_NOT_PARTICIPANT",
-    "CHAT_SEND_MEDIA_FORBIDDEN", "CHAT_SEND_PHOTOS_FORBIDDEN", "CHAT_SEND_VIDEOS_FORBIDDEN",
-    "CHAT_SEND_DOCS_FORBIDDEN", "CHAT_SEND_GIFS_FORBIDDEN", "CHAT_SEND_PLAIN_FORBIDDEN",
-})
-PHOTO_ERRORS = error_classes(
-    "PhotoInvalidDimensionsError", "PhotoSaveFileInvalidError", "ImageProcessFailedError", "PhotoExtInvalidError",
-    "PhotoCropSizeSmallError", "PhotoInvalidError", "MediaInvalidError",
-)
-# A kept upload handle that Telegram no longer knows (expired, other DC, parts lost): upload the file again.
-STALE_UPLOAD_ERRORS = error_classes(
-    "FilePartMissingError", "FilePartsInvalidError", "FileIdInvalidError", "FilePartInvalidError",
-    "FilePart0MissingError", "FilePartLengthInvalidError", "FilePartSizeInvalidError", "FilePartSizeChangedError",
-)
-# Telegram's own hiccups (HTTP 500 family). Telethon retries them five times and, with raise_last_call_error, raises
-# the last one: RANDOM_ID_DUPLICATE is one of them and means "an earlier attempt of this message went through".
-TRANSIENT_RPC_ERRORS = error_classes(
-    "ServerError", "RpcCallFailError", "RpcMcgetFailError", "InterdcCallErrorError", "InterdcCallRichErrorError",
-    "TimedOutError",
-)
-# Trouble with the link, not with the data: the same request can simply be repeated later (EOFError: a connection that
-# the other side closed in the middle of an answer).
-TRANSIENT_ERRORS = (
-    ConnectionError, EOFError, asyncio.TimeoutError, DeliveryUncertain, UserbotUnavailable, *TRANSIENT_RPC_ERRORS
-)
-
-
-def is_destination_error(exc: BaseException) -> bool:
-    return error_code(exc) in DESTINATION_CODES
-
-
-def is_file_error(exc: BaseException) -> bool:
-    """A refusal about the media itself (rejected media or picture), not about the chat, the account or the link."""
-    code = error_code(exc)
-    return code.startswith(("MEDIA_", "PHOTO_")) or code == "IMAGE_PROCESS_FAILED"
-
-
 def describe_unit(unit: list[SendItem]) -> str:
     """What an album is made of, for the log: «6 photo, 2 video, 1 without sound»."""
     parts = [f"{count} {kind}" for kind, count in Counter(item.kind for item in unit).items()]
     silent = sum(1 for item in unit if item.silent)
     return ", ".join(parts + ([f"{silent} without sound"] if silent else []))
-
-
-class Refusal(str):
-    """Why Telegram would not take a file. `lasting` means the file itself is at fault - not the moment, the chat or
-    the connection - so asking again would get the same answer and the file need not be downloaded again."""
-
-    lasting: bool
-
-    def __new__(cls, text: str, lasting: bool = False) -> "Refusal":
-        reason = super().__new__(cls, text)
-        reason.lasting = lasting
-        return reason
 
 
 class Userbot(Transport):
