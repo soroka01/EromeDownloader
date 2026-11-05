@@ -10,10 +10,10 @@ from typing import Callable
 
 from telethon import TelegramClient, errors
 
+from erome.telegram.client import new_client
 from erome.telegram.faults import WrongAccount
 from erome.telegram.names import display_name
 from erome.telegram.settings import TelegramSettings
-from erome.telegram.transport import new_client
 
 
 async def _qr_login(client: TelegramClient, say: Callable[[str], None], attempts: int) -> None:

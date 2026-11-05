@@ -265,6 +265,8 @@ EromeDownloader/
 │       ├── media.py       # file kind, video metadata, thumbnails
 │       ├── faults.py      # Telegram errors: what each one means, texts for the log and the owner
 │       ├── names.py       # account and group names for the console
+│       ├── client.py      # the Telethon client that never listens for updates
+│       ├── lanes.py       # the pool of extra upload connections (UploadLanes)
 │       ├── transport.py   # Telethon connection, requests, file uploads
 │       ├── signin.py      # first sign-in by QR code
 │       ├── userbot.py     # userbot - albums and messages, what counts as delivered

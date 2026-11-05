@@ -31,6 +31,7 @@ from erome.console import (
 from erome.downloader import download_jobs
 from erome.models import AlbumData, AlbumFetchError, DownloadResult, FileJob, LinkKind, Outcome
 from erome.net import collect_account_album_urls, collect_album_data
+from erome.telegram.client import task_is_cancelling
 from erome.telegram.faults import TRANSIENT_ERRORS, DestinationError, RetryLater, describe_error
 from erome.telegram.media import SendItem, prepare_item
 from erome.telegram.settings import TelegramSettings
@@ -45,7 +46,6 @@ from erome.telegram.state import (
     file_key,
     random_id_for,
 )
-from erome.telegram.transport import task_is_cancelling
 from erome.telegram.userbot import ALBUM_MAX_ITEMS, Userbot
 from erome.ui import human_size, plural
 from erome.urls import account_name_from_url, build_download_jobs, safe_name

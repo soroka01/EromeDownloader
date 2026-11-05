@@ -8,36 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import logging
 import os
-import random
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.network import MTProtoSender
-from telethon.tl.alltlobjects import LAYER
 
+from erome.telegram.client import new_client, task_is_cancelling
 from erome.telegram.faults import SESSION_ERRORS, RetryLater, UserbotUnavailable, WrongAccount, describe_error
+from erome.telegram.lanes import UploadLanes, without_updates
 from erome.telegram.names import display_name
 from erome.telegram.settings import TelegramSettings
 
 LOG = logging.getLogger("erome.tg")
-_LANE_LOG = logging.getLogger("erome.tg.lane")
-_LANE_LOG.addHandler(logging.NullHandler())
-_LANE_LOG.propagate = False
-
-
-class _LaneLoggers(dict):
-    """Loggers of the extra upload connections. Telethon words the ordinary end of such a connection (the server, or
-    something between, closing it) as a WARNING and an ERROR; a real loss is reported by the pool in its own words."""
-
-    def __missing__(self, key: str) -> logging.Logger:
-        return _LANE_LOG
-
-
 STATE_STARTING = "starting"
 STATE_READY = "ready"
 STATE_OFFLINE = "offline"
@@ -57,17 +43,6 @@ UPLOAD_WATCH_INTERVAL_SECONDS = 5.0
 # only ~1-3 MB/s; 8+ parts in flight on one connection is slower than 3). Measured on a Premium account:
 #   6 connections x 8 parts 7.5 MB/s | 16 x 3 10.0 | 24 x 3 15.8 | 32+ broke: corrupted packets.
 DEFAULT_PARALLEL_PARTS = 3
-EXTRA_CONNECTION_RETRY_SECONDS = 180.0
-# Telegram answers too many connections with a transport-level flood ("HTTP code 429" in the stream) and then drops
-# every connection at once. After this many lost extra connections within the window the pool is halved.
-LANE_FAILURE_LIMIT = 3
-LANE_FAILURE_WINDOW_SECONDS = 120.0
-MIN_UPLOAD_CONNECTIONS = 4
-# The pool is found by probing: it starts at START, grows by STEP after each quiet period and is halved when
-# Telegram drops connections.
-UPLOAD_CONNECTIONS_START = 8
-UPLOAD_CONNECTIONS_STEP = 2
-UPLOAD_CONNECTIONS_GROW_AFTER_SECONDS = 300.0
 # Telegram counts requests, not bytes: 512 KB parts (the maximum) halve the request rate of 256 KB ones.
 UPLOAD_PART_SIZE_BYTES = 512 * 1024
 BIG_FILE_THRESHOLD_BYTES = 10 * 1024 * 1024
@@ -93,96 +68,6 @@ class UploadHandle:
         self.sent = sent
         if self.listener is not None and delta > 0:
             self.listener(delta)
-
-
-def cryptg_available() -> bool:
-    try:
-        import cryptg  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-class _QuietTelegramClient(TelegramClient):
-    """A client that never listens for updates.
-
-    Telethon's own update loop keeps polling `getDifference` even for a client that asked for no updates. After a
-    network outage it can crash on a half-finished difference and disconnect the client, which cancels every
-    request in flight (uploads included). This program only sends, so the loop is replaced by an idle one.
-    """
-
-    def _is_current(self, handle_name: str) -> bool:
-        """False for a loop that a later `connect()` has replaced.
-
-        `connect()` starts new loops and forgets the old ones without stopping them. Telethon's own loops end by
-        themselves when the connection drops; these sleep first, so one that wakes up after a quick reconnect would
-        see a connected client again and live on next to its successor - one more pair after every short outage.
-        """
-        handle = getattr(self, handle_name, None)
-        return handle is None or handle is asyncio.current_task()
-
-    async def _update_loop(self) -> None:
-        queue = getattr(self, "_updates_queue", None)
-        while self.is_connected() and self._is_current("_updates_handle"):
-            if queue is None:
-                await asyncio.sleep(30)
-                continue
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(queue.get(), 30)  # whatever arrives unasked is dropped
-
-    async def _keepalive_loop(self) -> None:
-        """Telethon's loop waits on `self.disconnected` with a 60 s timeout. After a transport-level flood the client
-        can still count as connected while that future is already finished: `wait_for` then returns at once, the
-        loop never yields and the whole event loop starves (no log lines, uploads stuck, memory growing). This
-        version always sleeps first.
-        """
-        while self.is_connected() and self._is_current("_keepalive_handle"):
-            await asyncio.sleep(60)
-            if not self._is_current("_keepalive_handle"):
-                return
-            try:
-                await self._clean_exported_senders()
-                if not self._sender._transport_connected():
-                    continue
-                self._sender._keepalive_ping(random.randrange(-(2**63), 2**63))
-                await self._save_states_and_entities()
-                await utils.maybe_async(self.session.save())
-            except ConnectionError:
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # a failed housekeeping step must not stop the loop
-                LOG.debug("Telegram keepalive step failed: %s", exc)
-
-
-def task_is_cancelling() -> bool:
-    """True when this very task was asked to stop (as opposed to something it awaits being cancelled)."""
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
-
-
-def new_client(
-    settings: TelegramSettings,
-    *,
-    connection_retries: int = 3,
-    receive_updates: bool = False,
-) -> TelegramClient:
-    """receive_updates must stay on for the QR sign-in (the login token arrives as an update)."""
-    settings.session_path.parent.mkdir(parents=True, exist_ok=True)
-    factory = TelegramClient if receive_updates else _QuietTelegramClient
-    return factory(
-        str(settings.session_path),
-        settings.api_id,
-        settings.api_hash,
-        connection_retries=connection_retries,
-        request_retries=5,
-        retry_delay=2,
-        auto_reconnect=True,
-        receive_updates=receive_updates,
-        # Without this a RANDOM_ID_DUPLICATE (or any other 500) that survives Telethon's five retries turns into a
-        # bare ValueError, and the "already delivered" answer is never seen.
-        raise_last_call_error=True,
-    )
 
 
 class _Unauthorized(Exception):
@@ -211,13 +96,7 @@ class Transport:
         self.flood_until = 0.0
         self.parallel_parts = DEFAULT_PARALLEL_PARTS
         self.upload_connections = settings.upload_connections
-        self._extra_senders: list[MTProtoSender] = []
-        self._extra_owner: TelegramClient | None = None
-        self._extra_lock = asyncio.Lock()
-        self._extra_retry_at = 0.0
-        self._lane_failures: list[float] = []
-        self._lane_target = 0  # current size of the pool (0 = not chosen yet)
-        self._lane_quiet_since = time.monotonic()
+        self.lanes = UploadLanes(cap=lambda: self.upload_connections, spawn=self._spawn)
         self.client: TelegramClient | None = None
         self._peer: Any = None
         self._ready = asyncio.Event()
@@ -238,7 +117,7 @@ class Transport:
                 await self._task
             self._task = None
         self._ready.clear()
-        await self._close_extra_senders()
+        await self.lanes.close()
         if self.client is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.client.disconnect(), 10)
@@ -370,7 +249,7 @@ class Transport:
         self._set_state(STATE_OFFLINE, reason)
         if client is not None:
             self._spawn(self._safe_disconnect(client))
-        self._spawn(self._close_extra_senders())
+        self._spawn(self.lanes.close())
 
     @staticmethod
     async def _safe_disconnect(client: TelegramClient) -> None:
@@ -477,136 +356,6 @@ class Transport:
             path, file_name=path.name, progress_callback=lambda sent, _total: handle.set(sent)
         )
 
-    @staticmethod
-    def _without_updates(client: TelegramClient, request: Any) -> Any:
-        """Telethon wraps every request of an update-less client like this; a connection of our own must do the same,
-        or the server subscribes it to the account's updates (up to two dozen extra streams that nobody reads)."""
-        return functions.InvokeWithoutUpdatesRequest(request) if getattr(client, "_no_updates", False) else request
-
-    async def _new_upload_sender(self, client: TelegramClient) -> MTProtoSender:
-        """One more connection to the client's own DC with the same auth key (parts of one file are spread over them)."""
-        dc = await client._get_dc(client.session.dc_id)
-        # No automatic reconnection: a lane that breaks is dropped (its parts go over the main connection); two
-        # dozen senders redialling at once is what turns a hiccup into a flood.
-        loggers = _LaneLoggers()
-        sender = MTProtoSender(client.session.auth_key, loggers=loggers, auto_reconnect=False, retries=1)
-        try:
-            await sender.connect(
-                client._connection(
-                    dc.ip_address, dc.port, dc.id, loggers=loggers, proxy=client._proxy, local_addr=client._local_addr
-                )
-            )
-            init = copy.copy(client._init_request)
-            init.query = functions.help.GetConfigRequest()
-            await sender.send(self._without_updates(client, functions.InvokeWithLayerRequest(LAYER, init)))
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await sender.disconnect()
-            raise
-        return sender
-
-    async def _extra_upload_senders(self, client: TelegramClient) -> list[MTProtoSender]:
-        """Extra upload connections, created on demand and reused. Failing to get them just means fewer lanes."""
-        wanted = self._effective_upload_connections() - 1
-        if wanted <= 0:
-            return []
-        async with self._extra_lock:
-            if self._extra_owner is not client:
-                await self._close_extra_senders()
-                self._extra_owner = client
-            # A connection that the other side closed while it sat idle says nothing about overload (a loss during an
-            # upload does): it is replaced without counting against the pool.
-            for idle in [sender for sender in self._extra_senders if not sender.is_connected()]:
-                self._extra_senders.remove(idle)
-                self._spawn(self._safe_disconnect_sender(idle))
-                LOG.debug("An idle upload connection was closed from outside; opening a new one")
-            while len(self._extra_senders) > wanted:  # the pool was halved: let the surplus go
-                surplus = self._extra_senders.pop()
-                self._spawn(self._safe_disconnect_sender(surplus))
-            missing = wanted - len(self._extra_senders)
-            if missing > 0 and time.monotonic() >= self._extra_retry_at:
-                # Opened side by side: one after another, two dozen handshakes would delay the first file by a minute.
-                openings = [
-                    asyncio.ensure_future(
-                        asyncio.wait_for(
-                            self._new_upload_sender(client), CONNECT_TIMEOUT_SECONDS + HANDSHAKE_TIMEOUT_SECONDS
-                        )
-                    )
-                    for _ in range(missing)
-                ]
-                try:
-                    results = await asyncio.gather(*openings, return_exceptions=True)
-                except BaseException:  # cancelled while dialling: close what had already connected
-                    for opening in openings:
-                        opening.cancel()
-                    for late in await asyncio.gather(*openings, return_exceptions=True):
-                        if isinstance(late, MTProtoSender):
-                            self._spawn(self._safe_disconnect_sender(late))
-                    raise
-                failures = 0
-                for result in results:
-                    if isinstance(result, MTProtoSender):
-                        self._extra_senders.append(result)
-                    elif isinstance(result, asyncio.CancelledError) and task_is_cancelling():
-                        raise result
-                    else:
-                        failures += 1
-                if failures:
-                    LOG.warning(
-                        "%d of %d extra upload connections failed to open (%s); uploading over fewer connections",
-                        failures, missing, next((repr(r) for r in results if isinstance(r, BaseException)), ""),
-                    )
-                    self._extra_retry_at = time.monotonic() + EXTRA_CONNECTION_RETRY_SECONDS
-                LOG.info("Telegram upload connections: %d", 1 + len(self._extra_senders))
-            return list(self._extra_senders)
-
-    def _effective_upload_connections(self) -> int:
-        """How many connections to use now: probed upwards from a safe start, halved after losses."""
-        cap = max(1, self.upload_connections)
-        now = time.monotonic()
-        if self._lane_target <= 0:
-            self._lane_target = min(cap, UPLOAD_CONNECTIONS_START)
-            self._lane_quiet_since = now
-        elif self._lane_target < cap and now - self._lane_quiet_since >= UPLOAD_CONNECTIONS_GROW_AFTER_SECONDS:
-            self._lane_target = min(cap, self._lane_target + UPLOAD_CONNECTIONS_STEP)
-            self._lane_quiet_since = now
-            LOG.info("Telegram upload connections raised to %d (cap %d)", self._lane_target, cap)
-        self._lane_target = min(self._lane_target, cap)
-        return self._lane_target
-
-    def _note_lane_failure(self) -> None:
-        now = time.monotonic()
-        self._lane_failures.append(now)
-        del self._lane_failures[:-16]
-        self._lane_quiet_since = now
-        recent = sum(1 for stamp in self._lane_failures if now - stamp <= LANE_FAILURE_WINDOW_SECONDS)
-        if recent >= LANE_FAILURE_LIMIT:
-            before = self._lane_target or self.upload_connections
-            self._lane_target = max(MIN_UPLOAD_CONNECTIONS, before // 2)
-            self._lane_failures.clear()
-            LOG.warning(
-                "%d upload connections lost within %.0f s; pool %d -> %d connections",
-                recent, LANE_FAILURE_WINDOW_SECONDS, before, self._lane_target,
-            )
-
-    async def _close_extra_senders(self) -> None:
-        senders, self._extra_senders = self._extra_senders, []
-        self._extra_owner = None
-        await asyncio.gather(*(self._safe_disconnect_sender(sender) for sender in senders))  # all at once, not 5 s each
-
-    def _discard_extra_sender(self, sender: MTProtoSender, reason: object) -> None:
-        LOG.warning("Extra upload connection dropped (%s); its parts go over the main connection", reason)
-        self._extra_retry_at = time.monotonic() + EXTRA_CONNECTION_RETRY_SECONDS
-        self._note_lane_failure()
-        if sender in self._extra_senders:
-            self._extra_senders.remove(sender)
-        self._spawn(self._safe_disconnect_sender(sender))
-
-    @staticmethod
-    async def _safe_disconnect_sender(sender: MTProtoSender) -> None:
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(sender.disconnect(), 5)
-
     async def _upload_big_parallel(
         self, client: TelegramClient, path: Any, size: int, handle: UploadHandle
     ) -> types.InputFileBig:
@@ -619,7 +368,7 @@ class Transport:
         part_size = UPLOAD_PART_SIZE_BYTES
         part_count = (size + part_size - 1) // part_size
         file_id = _random_id()
-        lanes: list[MTProtoSender | None] = [None, *await self._extra_upload_senders(client)]  # None = own connection
+        lanes: list[MTProtoSender | None] = [None, *await self.lanes.acquire(client)]  # None = own connection
 
         async def send(index: int, data: bytes, lane: MTProtoSender | None) -> None:
             request = functions.upload.SaveBigFilePartRequest(file_id, index, part_count, data)
@@ -627,7 +376,7 @@ class Transport:
             if lane is not None:
                 try:
                     ok = await asyncio.wait_for(
-                        lane.send(self._without_updates(client, request)), REQUEST_TIMEOUT_SECONDS
+                        lane.send(without_updates(client, request)), REQUEST_TIMEOUT_SECONDS
                     )
                 except errors.FloodError:
                     raise
@@ -682,7 +431,7 @@ class Transport:
     def _forget_lane(self, lanes: list[MTProtoSender | None], lane: MTProtoSender, reason: object) -> None:
         if lane in lanes:
             lanes.remove(lane)
-            self._discard_extra_sender(lane, reason)
+            self.lanes.discard(lane, reason)
 
     async def _upload_with_watchdog(self, client: TelegramClient, path: Any, handle: UploadHandle) -> Any:
         """upload_file with a stall detector: no new part for UPLOAD_STALL_SECONDS means a dead connection."""
